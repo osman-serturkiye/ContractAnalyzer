@@ -1,0 +1,216 @@
+plugins {
+    id 'groovy'
+    id 'application'
+}
+
+group = "com.ser.emea"
+version = "1.0.0"
+
+sourceCompatibility = 1.11
+targetCompatibility = 1.11
+
+repositories {
+    mavenCentral()
+    maven {
+        url "https://repo.maven.apache.org/maven2/"
+    }
+    maven {
+        url "https://sergroup.jfrog.io/artifactory/public/"
+    }
+}
+
+configurations {
+    implementation.extendsFrom externalImplementation
+    agentsImplementation.extendsFrom implementation
+}
+
+sourceSets {
+    agents {
+        groovy {
+            srcDirs = ['agents/src']
+        }
+    }
+}
+
+dependencies {
+
+    // This also provides all transient dependencies usually found in the Agent Server frameworks
+    // The version number corresponds to the Java API (blueline) version, not the CSB version
+    implementation (group: 'de.ser.doxis4.agentserver', name: 'agentserver-pom', version: '14.0.0')
+
+    // Agent Tester Library
+    // This also provides all transient dependencies usually found in the Agent Server frameworks
+    // The version number corresponds to the Java API (blueline) version, not the CSB version
+    implementation (group: 'de.ser.doxis4.agentserver', name: 'agent-interfaces', version: '14.0.0')
+    implementation (group: 'de.ser.doxis4.agentserver', name: 'unified-agent', version: '14.0.0')
+
+    implementation (group: 'de.ser.doxis4.java-api', name: 'agent-utils', version: '14.0.0')
+    implementation (group: 'de.ser.doxis4.java-api', name: 'blueline', version: '14.0.0')
+
+    // https://mvnrepository.com/artifact/org.apache.logging.log4j/log4j-core
+    externalImplementation 'org.apache.logging.log4j:log4j-core:2.25.4'
+    externalImplementation 'org.apache.logging.log4j:log4j-api:2.20.0'
+
+    externalImplementation 'org.json:json:20231013'
+
+    // PDF: render pages / extract text (kept on 2.0.x to match openhtmltopdf)
+    externalImplementation 'org.apache.pdfbox:pdfbox:3.0.8'
+    // DOCX reading
+    externalImplementation 'org.apache.poi:poi-ooxml:5.4.0'
+    // Deterministic language detection for DOCX
+    externalImplementation 'com.github.pemistahl:lingua:1.2.2'
+    // Diff
+    externalImplementation 'io.github.java-diff-utils:java-diff-utils:4.12'
+    // Markdown -> HTML (report) and HTML -> PDF
+    externalImplementation 'org.commonmark:commonmark:0.22.0'
+    externalImplementation 'org.commonmark:commonmark-ext-gfm-tables:0.22.0'
+    //externalImplementation 'com.openhtmltopdf:openhtmltopdf-pdfbox:1.0.10'
+    externalImplementation "io.github.openhtmltopdf:openhtmltopdf-pdfbox:1.1.24"
+    externalImplementation 'com.github.jknack:handlebars:4.3.1'
+
+
+    // https://mvnrepository.com/artifact/com.mashape.unirest/unirest-java
+    externalImplementation group: 'com.mashape.unirest', name: 'unirest-java', version: '1.4.9'
+
+    // https://mvnrepository.com/artifact/com.sun.mail/jakarta.mail
+    externalImplementation group: 'com.sun.mail', name: 'jakarta.mail', version: '1.6.7'
+    // Put local JARs not pulled from a repository into /lib
+    // Example: sapjco3.jar (cannot be hosted in Artifactory)
+    externalImplementation fileTree(dir: 'lib', include: '*.jar')
+
+    // The Groovy sources in agerts/src are compiled for running any tests
+    // When executing the AgentTest they are (re-)compiled by a GroovyScriptEngine
+    ///testImplementation 'org.codehaus.groovy:groovy-all:3.0.11'
+    testImplementation 'org.apache.groovy:groovy-all:4.0.22'
+    testImplementation 'log4j:log4j:1.2.17'
+    testImplementation(sourceSets.agents.output)
+    testImplementation 'junit:junit:4.13.2'
+
+    testImplementation (group: 'de.ser.doxis4.java-api', name: 'dx4-sessionpool-api', version: '12.3.0')
+    testImplementation (group: 'de.ser.doxis4.java-api', name: 'dx4-sessionpool-impl', version: '12.3.0')
+}
+
+task processLogo(type: JavaExec) {
+    group = 'build'
+    description = 'Makes white background of logo transparent and saves as settings/logo.png'
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass = 'report.LogoProcessor'
+    args = ["settings/logo.png", "settings"]
+}
+
+task generateLogo(type: JavaExec) {
+    group = 'build'
+    description = 'Generates the mascot logo programmatically as settings/logo.png (transparent background)'
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass = 'report.SvgToPng'
+    args = ["settings"]
+}
+
+task updateConfigAssets(type: JavaExec) {
+    group = 'build'
+    description = 'Re-packs settings/ assets (HTML template, CSS, …) into config.json -> report.assets'
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass = 'report.ConfigAssetUpdater'
+    args = ["settings", "settings/config.json"]
+}
+
+task addStepConfig(type: JavaExec) {
+    group = 'build'
+    description = 'Adds or updates a single step entry in config.json -> steps'
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass = 'report.StepConfigUpdater'
+    // Override args at call time: gradle addStepConfig --args="settings/config.json <stepName> <json>"
+    args = ["settings/config.json", "crossClauseDependency",
+            '{"provider":"ms_foundry_openai_1","model":"gpt-5.2","maxTokens":8000,"jsonMode":true}']
+}
+
+task restoreStepConfig(type: JavaExec) {
+    group = 'build'
+    description = 'Restores all known steps into config.json -> steps (safe: existing entries are updated, others unchanged)'
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass = 'report.StepConfigUpdater'
+    args = [
+        "settings/config.json",
+        "__batch__",
+        """[
+          {"name":"clauseExtractionDOCOriginalDocument","provider":"ms_foundry_openai_1","model":"gpt-5.2","maxTokens":8000,"jsonMode":true},
+          {"name":"clauseSegmentationPDFSignedDocument", "provider":"ms_foundry_openai_1","model":"gpt-5.2","maxTokens":8000,"jsonMode":true},
+          {"name":"signaturePageDetection",              "provider":"ms_foundry_openai_1","model":"gpt-5.2","maxTokens":2000,"jsonMode":true},
+          {"name":"pdfPageBlockOcr",                     "provider":"ms_foundry_mistral_1","model":"mistral-ocr-4-0"},
+          {"name":"aiClauseCompare","provider":"ms_foundry_openai_1","model":"gpt-5.2","maxTokens":8000,"jsonMode":true,"clauseUnits":["LEGAL","FINANCE","DPO","COMPLIANCE","EXECUTIVE","PROCUREMENT","OPERATIONS","ALL_USERS"],"clauseUnitLabels":{"LEGAL":{"tr":"Hukuk","en":"Legal"},"FINANCE":{"tr":"Finans","en":"Finance"},"DPO":{"tr":"KVK/DPO","en":"DPO"},"COMPLIANCE":{"tr":"Uyum","en":"Compliance"},"EXECUTIVE":{"tr":"Yonetim","en":"Executive"},"PROCUREMENT":{"tr":"Satin Alma","en":"Procurement"},"OPERATIONS":{"tr":"Operasyon","en":"Operations"},"ALL_USERS":{"tr":"Tum Birimler","en":"All Users"}}},
+          {"name":"crossClauseDependency",               "provider":"ms_foundry_openai_1","model":"gpt-5.2","maxTokens":8000,"jsonMode":true}
+        ]"""
+    ]
+}
+
+task copyExternalDependencies(type: Copy) {
+    group = 'build'
+    into "$buildDir/libs"
+    from configurations.externalImplementation
+}
+
+jar {
+    dependsOn(project.tasks.copyExternalDependencies)
+    // Add the compiled groovy agents
+    // With CSB 4.2+ they can be run as Java agents, because Groovy libs are now on the classpath
+    from sourceSets.agents.output.classesDirs
+}
+
+tasks.withType(GroovyCompile) {
+    groovyOptions.optimizationOptions.indy = true
+
+}
+
+test {
+    minHeapSize = "2g"
+    maxHeapSize = "4g"
+
+    systemProperty "file.encoding", "utf-8"
+
+    useJUnit()
+}
+
+application {
+    mainClass = "junit.AgentTester"
+}
+
+run {
+    standardInput = System.in
+    minHeapSize = "512m"
+    maxHeapSize = "4g"
+    jvmArgs = ["-XX:+UseG1GC", "-XX:MaxGCPauseMillis=200"]
+}
+
+
+// ---- addUnitConfig: writes clauseUnits + clauseUnitLabels into config.json directly (no Java subprocess) ----
+import groovy.json.JsonSlurper
+import groovy.json.JsonOutput
+
+task addUnitConfig {
+    group = 'build'
+    description = 'Adds clauseUnits and clauseUnitLabels to steps.aiClauseCompare in config.json'
+    doLast {
+        def cfgFile = file('settings/config.json')
+        def cfg = new JsonSlurper().parse(cfgFile, 'UTF-8')
+
+        if (!cfg.steps)                    cfg.steps = [:]
+        if (!cfg.steps.aiClauseCompare)    cfg.steps.aiClauseCompare = [:]
+
+        cfg.steps.aiClauseCompare.clauseUnits = [
+            'LEGAL','FINANCE','DPO','COMPLIANCE','EXECUTIVE','PROCUREMENT','OPERATIONS','ALL_USERS'
+        ]
+        cfg.steps.aiClauseCompare.clauseUnitLabels = [
+            LEGAL:       [tr: 'Hukuk',          en: 'Legal'],
+            FINANCE:     [tr: 'Finans',          en: 'Finance'],
+            DPO:         [tr: 'KVK/DPO',         en: 'DPO'],
+            COMPLIANCE:  [tr: 'Uyum',            en: 'Compliance'],
+            EXECUTIVE:   [tr: 'Y\u00f6netim',    en: 'Executive'],
+            PROCUREMENT: [tr: 'Sat\u0131n Alma', en: 'Procurement'],
+            OPERATIONS:  [tr: 'Operasyon',       en: 'Operations'],
+            ALL_USERS:   [tr: 'T\u00fcm Birimler', en: 'All Users']
+        ]
+
+        cfgFile.setText(JsonOutput.prettyPrint(JsonOutput.toJson(cfg)), 'UTF-8')
+        println "addUnitConfig: clauseUnits written to ${cfgFile}"
+    }
+}
