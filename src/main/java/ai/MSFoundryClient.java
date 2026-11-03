@@ -381,6 +381,17 @@ public final class MSFoundryClient extends BaseClient {
         }
 
         /*
+         * Reasoning effort
+         *
+         * Supported by o-series and newer models (e.g. gpt-6-astra).
+         * Set "reasoningEffort": "low" | "medium" | "high" in the provider config.
+         */
+        String reasoningEffort = cfg.optString("reasoningEffort", "");
+        if (!reasoningEffort.isEmpty()) {
+            body.put("reasoning_effort", reasoningEffort);
+        }
+
+        /*
          * JSON mode
          */
         if (r.jsonMode &&
