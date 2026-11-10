@@ -144,12 +144,49 @@ public final class ClauseTree {
      */
     private final boolean keepResetAsSegment;
 
+    /**
+     * Parantezli alt madde olarak kabul edilmesi için gereken minimum tail uzunluğu
+     * (parantezden sonraki metin, karakter cinsinden).
+     *
+     * <p>Tanım listeleri "(a) Amerika Birleşik Devletleri;" gibi çok kısa kalemler
+     * içerir. Gerçek sub-clause içerikleri ise tipik olarak 50+ karakter uzunluğundadır.
+     * Bu eşiğin altındaki parantezli satırlar body metni olarak eklenir, ayrı madde
+     * numarası almaz.
+     *
+     * <p>Default: 50 karakter — kısa tanım listesi kalemlerini filtreler, gerçek sub-clause'ları korur.
+     * Örnekler:
+     * <ul>
+     *   <li>"(a) Amerika Birleşik Devletleri;" → tail 30 char → tanım listesi → body</li>
+     *   <li>"(a) yaptırım listesinde yer alan birden fazla kişinin sahibi..." → 50+ char → sub-clause</li>
+     * </ul>
+     */
+    private final int minParenTailChars;
+
+    /**
+     * Aynı parent altında kabul edilecek maksimum parantezli alt madde sayısı.
+     *
+     * <p>Gerçek sözleşmelerde bir maddenin (a)(b)(c) alt maddeleri genellikle 6'yı
+     * geçmez. Daha uzun seriler (örn. "Yaptırım Otoritesi" tanımındaki 6 ülke listesi)
+     * tanım listesidir; {@code minParenTailChars} bu durumları zaten yakalamalı,
+     * ama bu sayaç ek güvence sağlar.
+     *
+     * <p>Default: 12. 12'den fazla parantezli kalem aynı parent altında gelirse
+     * kalanlar body'e eklenir.
+     */
+    private final int maxParenPerParent;
+
     public ClauseTree() {
         this(true);
     }
 
     public ClauseTree(boolean keepResetAsSegment) {
-        this.keepResetAsSegment = keepResetAsSegment;
+        this(keepResetAsSegment, 50, 15);
+    }
+
+    public ClauseTree(boolean keepResetAsSegment, int minParenTailChars, int maxParenPerParent) {
+        this.keepResetAsSegment  = keepResetAsSegment;
+        this.minParenTailChars   = minParenTailChars;
+        this.maxParenPerParent   = maxParenPerParent;
     }
 
     // ------------------------------------------------------------------
@@ -197,11 +234,31 @@ public final class ClauseTree {
             // Numera elde edildi — sınıflandır
             String candidateNo;
             if (pr.kind == ClauseNumbering.Kind.PARENTHESIZED) {
-                // Parantezli alt madde: parent altında sıralı numera
+                // Parantezli alt madde: parent altında sıralı numera.
+                // İki guard ile tanım listesi kalemlerini filtrele:
+                //   1. tail çok kısaysa (< minParenTailChars) → tanım listesi kalemi, body olarak ekle.
+                //   2. parenCounter zaten maxParenPerParent'e ulaştıysa → body olarak ekle.
                 if (currentParent == null) {
                     // Parent yoksa gövde olarak ekle
                     appendToCurrentClause(curSeg, currentNo, block.id);
                     diagnostics.add("PAREN_NO_PARENT block=" + block.id);
+                    continue;
+                }
+                // Guard 1: tail uzunluğu kontrolü — kısa kalemler tanım listesidir
+                if (pr.tail.length() < minParenTailChars) {
+                    appendToCurrentClause(curSeg, currentNo, block.id);
+                    diagnostics.add("PAREN_SHORT_TAIL block=" + block.id
+                            + " tail_len=" + pr.tail.length()
+                            + " min=" + minParenTailChars
+                            + " text='" + abbreviate(text, 60) + "'");
+                    continue;
+                }
+                // Guard 2: aynı parent altında çok fazla parantezli kalem
+                if (parenCounter >= maxParenPerParent) {
+                    appendToCurrentClause(curSeg, currentNo, block.id);
+                    diagnostics.add("PAREN_OVERFLOW block=" + block.id
+                            + " parent=" + currentParent
+                            + " counter=" + parenCounter);
                     continue;
                 }
                 parenCounter++;

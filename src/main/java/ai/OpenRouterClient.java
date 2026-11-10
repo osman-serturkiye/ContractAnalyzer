@@ -157,4 +157,15 @@ public final class OpenRouterClient extends BaseClient {
         }
         return text;
     }
+
+    @Override
+    public ChatResult chatWithUsage(ChatRequest r) throws IOException {
+        // OpenRouter uyumlu: OpenAI usage alanlarını döndürür
+        // chat() metodunu çağırıp ayrıca usage almak için response'u yeniden işleyelim
+        // Ancak chat() response'u döndürmüyor; default implementation yeterli
+        // Gerçek usage için provider yanıtını tekrar almalıyız — default ile aynı davranış
+        // OpenRouter usage.prompt_tokens döndürür ama yeniden HTTP çağrısı yapmak istenmez.
+        // OpenAiCompatibleClient'ın chatWithUsage'ını devralıyoruz (aynı request formatı).
+        return new OpenAiCompatibleClient(name, cfg).chatWithUsage(r);
+    }
 }

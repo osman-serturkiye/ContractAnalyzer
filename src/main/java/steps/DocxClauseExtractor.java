@@ -109,8 +109,16 @@ public final class DocxClauseExtractor {
                 if (c == null) continue;
                 String no = ClauseNumber.normalize(c.optString("number", ""));
                 if (no == null) continue;
-                if (!ClauseNumber.isValidNextClause(prev.isEmpty() ? null : prev, no)) {
-                    log.debug("DOCX [{}] clause {} rejected — not a valid successor of '{}'", lang, no, prev);
+
+                // Ardıllık doğrulama: sadece INVALID reddedilir.
+                // VALID, DUPLICATE, RESET ve BACKWARD kabul edilir.
+                // - RESET: parent atlanarak alt-maddeye giriş (örn. "6.4"→"7.1", "9.4"→"11.1")
+                // - BACKWARD: belgede numara sırası bozuksa geri dönüş (örn. "11"→"9")
+                // AI atıfları zaten filtrelemelidir; Java over-validate ederek geçerli maddeleri yutmamalı.
+                extraction.ClauseNumbering.Relation rel =
+                        extraction.ClauseNumbering.classify(prev.isEmpty() ? null : prev, no);
+                if (rel == extraction.ClauseNumbering.Relation.INVALID) {
+                    log.debug("DOCX [{}] clause {} rejected ({}) — prev='{}'", lang, no, rel, prev);
                     continue;
                 }
                 List<Integer> ids = parseIds(c.opt("blocks"), workingBlocks.size());
@@ -238,10 +246,12 @@ public final class DocxClauseExtractor {
                 .append("  - Word+numeral (Arabic): \"المادة 1\"\n")
                 .append("  - Roman numerals used as top-level clause numbers: \"I\", \"II\", \"III\"\n")
                 .append("  - Parenthesized decimal sub-clauses (very common in English/international contracts): ")
-                .append("\"(1)\", \"(2)\", \"(3)\" — these are sub-clauses of the enclosing numbered clause.\n")
+                .append("\"(1)\", \"(2)\", \"(3)\" — these are sub-clauses ONLY when their content is a full obligation/right/condition (typically 50+ characters).\n")
                 .append("    Example: inside clause 4, the sequence (1), (2), (3) maps to \"4.1\", \"4.2\", \"4.3\".\n")
-                .append("  - Parenthesized letter sub-clauses: \"(a)\", \"(b)\", \"(c)\" — also sub-clauses of the enclosing clause.\n")
+                .append("    EXCEPTION: Short definition list items like \"(a) United States;\", \"(b) United Kingdom;\" are NOT sub-clauses — assign them to the parent clause body.\n")
+                .append("  - Parenthesized letter sub-clauses: \"(a)\", \"(b)\", \"(c)\" — sub-clauses of the enclosing clause ONLY when substantive (50+ chars).\n")
                 .append("    Example: inside clause 5, the sequence (a), (b) maps to \"5.1\", \"5.2\".\n")
+                .append("    EXCEPTION: Short items like \"(a) Amerika Birleşik Devletleri;\", \"(b) Birleşik Krallık;\" are definition-list items — keep in parent clause body.\n")
                 .append("  - Parenthesized roman numeral sub-clauses: \"(i)\", \"(ii)\", \"(iii)\" — sub-clauses of the enclosing clause.\n")
                 .append("    Example: inside clause 5.1, the sequence (i), (ii) maps to \"5.1.1\", \"5.1.2\".\n")
                 .append("For the \"number\" field always use Arabic digits and dots only:\n")
@@ -251,6 +261,11 @@ public final class DocxClauseExtractor {
                 .append("assign it a sequential number continuing from the last known clause.\n")
                 .append("IMPORTANT: Every sub-clause (e.g. \"1.1\", \"1.2\") MUST be returned as a SEPARATE entry ")
                 .append("with its own \"number\" and \"blocks\". Do NOT merge sub-clauses into their parent clause.\n")
+                .append("PARENT CLAUSE BODY RULE: Blocks that appear AFTER the last sub-clause (e.g. after 1.2) but ")
+                .append("belong to the same section topic should be assigned to the LAST sub-clause, NOT the parent.\n")
+                .append("  Example: if clause 1 has 1.1 and 1.2, and a paragraph appears after 1.2 about parties — ")
+                .append("that paragraph belongs to 1.2 (last sub-clause), not to 1 (parent).\n")
+                .append("  EXCEPTION: If a paragraph appears BETWEEN the parent heading and the first sub-clause, it belongs to the parent.\n")
                 .append("For each clause return:\n")
                 .append(" - number: Arabic digits and dots only (e.g. \"1\", \"1.1\", \"1.2\", \"2.3.4\")\n")
                 .append(" - blocks: ids of ALL blocks that belong to that clause's OWN text, as a compact string of ids and ")
@@ -263,8 +278,10 @@ public final class DocxClauseExtractor {
                 .append("The previous part ended inside clause \"").append(prev).append("\": if the first blocks continue it, ")
                 .append("return that same number again.\n")
                 .append("IMPORTANT — clause numbering must continue logically from \"").append(prev).append("\":\n")
-                .append("  - The next top-level clause after N is N+1 (small increment, typically 1).\n")
+                .append("  - The next top-level clause after N is typically N+1 but may skip (e.g. 9→11 if 10 is absent).\n")
                 .append("  - A sub-clause of N is N.1; a sub-clause of N.K is N.K.1.\n")
+                .append("  - After sub-clause N.K the next valid numbers are: N.K+1 (sibling), N+1 (back to parent level),\n")
+                .append("    or N+1.1 (parent advanced then into sub-clause). All of these are acceptable.\n")
                 .append("  - Parenthesized sub-clauses (1),(2)/(a),(b)/(i),(ii) are sequential children of the enclosing clause: ")
                 .append("first → N.1, second → N.2, etc. (continuing from the last assigned child if the chunk starts mid-sequence).\n")
                 .append("  - Numbers appearing in body text as legal references (e.g. \"HMK'nın 193. maddesi\", ")

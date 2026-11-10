@@ -54,8 +54,8 @@ public final class ClauseNumbering {
             "^(\\d{1,4}(?:\\.\\d{1,4}){1,4}\\.?)(?:[\\s:]|$|(?=\\.[^\\d]))"
             // G2: single-level trailing dot  "1."  "2."
             + "|^(\\d{1,4}\\.)(?:[\\s:]|$)"
-            // G3: bare integer, ONLY when whole line (no lowercase text follows — guards refs like "3. maddede")
-            + "|^(\\d{1,4})(?:\\s+[\\p{Lu}\\p{N}]|$)"
+            // G3: bare integer, ONLY when followed by uppercase/digit (not EOL — prevents page numbers)
+            + "|^(\\d{1,4})(?:\\s+[\\p{Lu}\\p{N}])"
             // G4: keyword prefix (case-insensitive) — Madde, MADDE, Md., Article, Art., Section, Clause, §, Artikel, Ziffer
             + "|^(?:MADDE|Madde|madde|Md\\.?|ARTICLE|Article|article|Art\\.?|SECTION|Section|section"
             +   "|CLAUSE|Clause|clause|§\\s*|ARTIKEL|Artikel|artikel|ZIFFER|Ziffer|ziffer)\\s*(\\d[\\d.]*)"
@@ -98,6 +98,30 @@ public final class ClauseNumbering {
 
     // Numeric-only matcher for normalize()
     private static final Pattern NUMERIC_DOTTED = Pattern.compile("\\d+(?:\\.\\d+)*");
+
+    // ------------------------------------------------------------------
+    // Artifact prefix pattern'leri — DOCX/OCR kaynaklı bozuk numara prefix'lerini temizler.
+
+    /** Tür B: yapışık çift numara "418." veya "1617." */
+    private static final Pattern ARTIFACT_CONCAT_NUM = Pattern.compile(
+            "^(\\d{1,3})(\\d{1,2})[.\\s]"
+    );
+
+    // Satırın bir başlık numarası ile açılıp açılmadığını hızlıca kontrol eder.
+    // isLegalReference() guard'ı için kullanılır — heading ile başlayan satırlar
+    // hiçbir zaman yasal atıf sayılmaz.
+    // Numeric part: rakam + nokta + BÜYÜK harf/rakam — lowercase takip edilirse match etmez
+    // (CASE_INSENSITIVE olmadan, çünkü \p{Lu} büyük harf anlamına gelir).
+    // Keyword part: MADDE/Article/§ — explicit casing alternation.
+    private static final Pattern HEADING_START_NUM = Pattern.compile(
+            "^\\d{1,4}(?:\\.\\d{1,4})*\\.?(?:\\s+[\\p{Lu}\\p{N}]|:|$)"
+    );
+    private static final Pattern HEADING_START_KW = Pattern.compile(
+            "^(?:MADDE|Madde|madde|Md\\.?|ARTICLE|Article|article|Art\\.?|SECTION|Section|section"
+            +   "|CLAUSE|Clause|clause|§\\s*|ARTIKEL|Artikel|artikel|ZIFFER|Ziffer|ziffer)\\s*\\d"
+            + "|\u0627\u0644\u0645\u0627\u062f\u0629\\s*\\d",
+            Pattern.UNICODE_CHARACTER_CLASS
+    );
 
     // Roman numerals → decimal
     private static final String[] ROMAN_WORDS = {"XII","XI","IX","VIII","VII","VI","IV","III","II","I","X","V"};
@@ -150,13 +174,16 @@ public final class ClauseNumbering {
         String t = line.trim();
         if (t.isEmpty()) return null;
 
-        // Yasal çapraz-atıf reddi: "HMK'nın 193. maddesi" gibi satırlar heading değil.
-        // Tam satır bir referans ise çevirme yapma. Ama headings içinde de geçebilir
-        // (örn. "Madde 5 — HMK 193 uyarınca") — bu yüzden sadece satırın tamamı
-        // referans ise reddediyoruz.
-        if (isLegalReference(t)) return null;
+        // Markdown formatting temizliği: "**MADDE 1" → "MADDE 1", "**3.1. **" → "3.1. "
+        String demd = stripMarkdownPrefix(t);
 
-        Matcher m = HEADING.matcher(t);
+        // Yasal çapraz-atıf reddi (markdown temizlenmiş metin üzerinde)
+        if (isLegalReference(demd)) return null;
+
+        // Artifact prefix temizliği: "0000D 11." → "11.", "418." → "18."
+        String cleaned = stripArtifactPrefix(demd);
+
+        Matcher m = HEADING.matcher(cleaned);
         if (!m.find()) return null;
 
         String raw;
@@ -165,10 +192,17 @@ public final class ClauseNumbering {
 
         if (m.group(1) != null) {
             raw = m.group(1); no = stripTrailingDot(raw); kind = Kind.EXPLICIT;
+            // Tarih tespiti: "20.02.2025" gibi bileşenlerden biri 31'den büyükse tarih → null
+            for (String part : no.split("\\.")) {
+                try { if (Integer.parseInt(part) > 31) return null; } catch (NumberFormatException ignore) {}
+            }
         } else if (m.group(2) != null) {
             raw = m.group(2); no = stripTrailingDot(raw); kind = Kind.EXPLICIT;
         } else if (m.group(3) != null) {
             raw = m.group(3); no = raw; kind = Kind.EXPLICIT;
+            // Guard: çok haneli sıfır-başlayan bare integer'lar clause değildir
+            // (örn. IBAN fragment "0001" → null döner)
+            if (raw.length() > 1 && raw.charAt(0) == '0') return null;
         } else if (m.group(4) != null) {
             raw = m.group(0).trim(); no = normalizeNo(m.group(4)); kind = Kind.EXPLICIT;
         } else if (m.group(5) != null) {
@@ -191,7 +225,7 @@ public final class ClauseNumbering {
 
         if (no == null || no.isEmpty()) return null;
 
-        String tail = t.substring(m.end()).trim();
+        String tail = cleaned.substring(m.end()).trim();
         return new ParseResult(no, raw, tail, kind);
     }
 
@@ -265,7 +299,17 @@ public final class ClauseNumbering {
         } else if (candDepth == curDepth + 1) {
             // Bir seviye derine: prefix = current tam, yeni bileşen = 1
             for (int i = 0; i < curDepth; i++) {
-                if (cands[i] != currs[i]) return Relation.INVALID;
+                if (cands[i] != currs[i]) {
+                    // Prefix farklı: parent atlanarak alt-maddeye giriş.
+                    // Word auto-numbering offset: heading "8." ama sub-clause "9.1."
+                    // — parent = current+1 olabilir (tek seviyede, sadece +1 offset).
+                    // Bu durumu VALID kabul et; parent sayısı daha sonra ensureParents
+                    // ile tamamlanır.
+                    if (curDepth == 1 && cands[0] == currs[0] + 1 && cands[1] == 1) {
+                        return Relation.VALID;
+                    }
+                    return Relation.RESET;
+                }
             }
             return cands[candDepth - 1] == 1 ? Relation.VALID : Relation.INVALID;
 
@@ -337,7 +381,11 @@ public final class ClauseNumbering {
     /** "HMK'nın 193. maddesi", "3. maddede belirtilen" gibi yasal atıf satırlarını tespit eder. */
     public static boolean isLegalReference(String line) {
         if (line == null || line.isEmpty()) return false;
-        String t = line.trim();
+        // Markdown formatting temizle: "**7.5. **İŞ SAHİBİ..." → "7.5. İŞ SAHİBİ..."
+        String t = stripMarkdownPrefix(line.trim());
+
+        // Guard: satır kendi başlık numarası ile açılıyorsa referans olamaz.
+        if (HEADING_START_NUM.matcher(t).find() || HEADING_START_KW.matcher(t).find()) return false;
 
         // Kural 1: satır keyword + büyük sayı ile başlıyor (tek bileşen, nokta yok) → atıf
         Matcher m = Pattern.compile(
@@ -363,6 +411,86 @@ public final class ClauseNumbering {
 
     private static String normalizeNo(String raw) {
         return stripTrailingDot(raw == null ? null : raw.trim());
+    }
+
+    /**
+     * DOCX/OCR artifact prefix'lerini temizler.
+     *
+     * <p>İki tür artifact desteklenir:
+     * <ul>
+     *   <li><b>Tür A — alfanümerik çöp:</b> {@code "0000D 11. ACCEPTANCE"} →
+     *       {@code "11. ACCEPTANCE"}.</li>
+     *   <li><b>Tür B — yapışık numara:</b> {@code "418. LIABILITY"} → {@code "18. LIABILITY"}.
+     *       Kural: toplam ≤ 4 hane, ikinci part 1–2 hane ve ≤ 31, birinci part &lt;
+     *       ikinci part. Çok seviyeli numara (12.1) ise uygulanmaz.</li>
+     * </ul>
+     */
+    public static String stripArtifactPrefix(String t) {
+        if (t == null || t.isEmpty()) return t;
+
+        // Tür A: alfanümerik prefix + boşluk (örn. "0000D 11.", "ABC 3.")
+        int spaceIdx = t.indexOf(' ');
+        if (spaceIdx > 0 && spaceIdx <= 8) {
+            String prefix = t.substring(0, spaceIdx);
+            String rest   = t.substring(spaceIdx + 1).trim();
+            if (prefix.matches("[A-Za-z0-9]+")
+                    && prefix.matches(".*\\d.*")  // en az bir rakam içermeli (saf harf kısaltmalar FZA, ABC soyulmaz)
+                    && (prefix.matches(".*[A-Za-z].*") || prefix.matches("0{2,}.*"))
+                    && !rest.isEmpty() && Character.isDigit(rest.charAt(0))) {
+                // Guard: clause-number keyword'leri artefact değildir
+                if (!isClauseKeywordPrefix(prefix)) {
+                    return rest;
+                }
+            }
+        }
+
+        // Tür B: yapışık çift numara (örn. "418.", "1617.")
+        // Guard: çok seviyeli numara (12.1, 13.1) ise uygulama — nokta gerçek separator
+        if (!t.matches("\\d+\\.\\d+.*")) {
+            Matcher mb = ARTIFACT_CONCAT_NUM.matcher(t);
+            if (mb.find()) {
+                String part1 = mb.group(1);
+                String part2 = mb.group(2);
+                try {
+                    int n1 = Integer.parseInt(part1);
+                    int n2 = Integer.parseInt(part2);
+                    int totalLen = part1.length() + part2.length();
+                    int total = n1 * (int)Math.pow(10, part2.length()) + n2;
+                    // Toplam sayı > 31 ise artifact (418 → strip), ≤ 31 ise gerçek clause (12 → koru)
+                    if (n2 >= 1 && n2 <= 31 && n1 < n2 && totalLen <= 4 && total > 31) {
+                        return t.substring(part1.length());
+                    }
+                } catch (NumberFormatException ignore) {
+                }
+            }
+        }
+
+        return t;
+    }
+
+    /**
+     * Markdown formatting marker'larını metnin başından ve sayıdan sonra temizler.
+     * DocxReader paragraphToMarkdown() metni bold ve heading marker'lari ile sarar.
+     */
+    static String stripMarkdownPrefix(String t) {
+        if (t == null || t.isEmpty()) return t;
+        // Tüm markdown bold/italic marker'larini kaldir.
+        // Bu metin sadece numara tespiti icin kullanilir —
+        // icerik orijinal blok metninden gelir (markdown korunur).
+        String s = t.replace("**", "").replace("*", "");
+        s = s.replaceAll("^[#_`]+", "");
+        return s.trim();
+    }
+
+    /**
+     * Verilen prefix'in clause-number keyword'ünden biri olup olmadığını kontrol eder.
+     */
+    private static boolean isClauseKeywordPrefix(String prefix) {
+        String u = prefix.toUpperCase(java.util.Locale.ROOT);
+        return u.equals("MADDE") || u.equals("MD") || u.equals("MAD")
+            || u.equals("ARTICLE") || u.equals("ART")
+            || u.equals("SECTION") || u.equals("CLAUSE")
+            || u.equals("ARTIKEL") || u.equals("ZIFFER");
     }
 
     private static int[] parts(String no) {

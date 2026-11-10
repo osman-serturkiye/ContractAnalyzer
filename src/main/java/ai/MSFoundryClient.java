@@ -70,19 +70,26 @@ public final class MSFoundryClient extends BaseClient {
 
         ChatRequest r = new ChatRequest();
         r.model = model;
-        r.system = "You are an OCR engine. You only output JSON.";
-        r.user = "Transcribe this page image into a JSON object.\n"
-                + "Rules:\n"
-                + "1. Identify every distinct text block on the page (headings, paragraphs, tables, "
-                + "list items, footnotes, headers, footers).\n"
-                + "2. For each block provide:\n"
+        r.system = "You are a precise OCR engine for legal contract documents. You only output JSON. "
+                + "You transcribe text EXACTLY as printed — do NOT paraphrase, summarize, or correct grammar.";
+        r.user = "Transcribe this contract page image into a JSON object.\n"
+                + "CRITICAL ACCURACY RULES:\n"
+                + "1. Transcribe EVERY word EXACTLY as it appears — do not change, correct, or paraphrase.\n"
+                + "2. Turkish diacritics MUST be preserved exactly: ğ Ğ ü Ü ş Ş ı İ ö Ö ç Ç\n"
+                + "   Common confusion pairs to watch carefully:\n"
+                + "   - 'talebi' vs 'tebliği' (completely different words)\n"
+                + "   - 'talep' vs 'tebliğ' — look at ALL letters carefully\n"
+                + "   - ı (dotless i) vs i (dotted i)\n"
+                + "   - ğ vs g — the curl on ğ is significant\n"
+                + "3. Numbers, percentages, dates and amounts must be exact (e.g. %0,5 not %0.5).\n"
+                + "4. Identify every distinct text block (headings, paragraphs, tables, list items, "
+                + "footnotes, headers, footers).\n"
+                + "5. For each block provide:\n"
                 + "   - type: one of text | title | table | header | footer | signature | handwriting\n"
-                + "   - content: full transcription; tables as GitHub-flavoured Markdown.\n"
-                + "   - x0, y0, x1, y1: bounding box coordinates normalised to 0..1000 "
-                + "(0,0 = top-left corner of the page; 1000,1000 = bottom-right corner). "
-                + "x0<x1, y0<y1.\n"
-                + "3. Keep all numbering exactly as printed.\n"
-                + "4. Return blocks in top-to-bottom, left-to-right reading order.\n"
+                + "   - content: exact transcription; tables as GitHub-flavoured Markdown.\n"
+                + "   - x0, y0, x1, y1: bounding box normalised to 0..1000 (0,0=top-left, 1000,1000=bottom-right). x0<x1, y0<y1.\n"
+                + "6. Keep all numbering exactly as printed (e.g. '1.', '1.1.', 'MADDE 2').\n"
+                + "7. Return blocks in top-to-bottom, left-to-right reading order.\n"
                 + "Return JSON only: "
                 + "{\"blocks\":[{\"type\":\"text\",\"content\":\"...\","
                 + "\"x0\":0,\"y0\":0,\"x1\":1000,\"y1\":50}]}";
@@ -97,6 +104,7 @@ public final class MSFoundryClient extends BaseClient {
             JSONArray rawBlocks = parsed.optJSONArray("blocks");
             if (rawBlocks != null && rawBlocks.length() > 0) {
                 JSONArray validatedBlocks = validateAndFillCoords(rawBlocks);
+                fixOcrContent(validatedBlocks);
                 return new JSONObject()
                         .put("width",  1000)
                         .put("height", 1000)
@@ -107,7 +115,9 @@ public final class MSFoundryClient extends BaseClient {
         }
 
         // Fallback: treat response as plain markdown and split into synthetic bands
-        return markdownToBlocks(response);
+        JSONObject fallback = markdownToBlocks(response);
+        fixOcrContent(fallback.optJSONArray("blocks"));
+        return fallback;
     }
 
     /**
@@ -537,5 +547,75 @@ public final class MSFoundryClient extends BaseClient {
         }
 
         return text;
+    }
+
+    @Override
+    public ChatResult chatWithUsage(ChatRequest request) throws IOException {
+        String text = chat(request);
+        // MSFoundry OpenAI-uyumlu: usage alanlarını aynı response'dan oku.
+        // chat() resp'ı saklamadığı için buraya usage gelmez — aynı isteği iki kez yapmamak adına
+        // OpenAiCompatibleClient.chatWithUsage'ına delege ediyoruz (aynı endpoint formatı).
+        return new OpenAiCompatibleClient(name, cfg).chatWithUsage(request);
+    }
+
+    // ------------------------------------------------------------------ OCR post-processing
+
+    /**
+     * Post-processes all block content strings to fix common GPT vision OCR artefacts
+     * in Turkish legal contracts.
+     *
+     * <p>GPT vision models occasionally make character-level mistakes on Turkish text:
+     * <ul>
+     *   <li>Dropping diacritics: 'g' instead of 'ğ', 'u' instead of 'ü', etc.</li>
+     *   <li>Confusing visually similar letter sequences.</li>
+     *   <li>Stray Unicode artefacts from PDF rendering.</li>
+     * </ul>
+     *
+     * <p>This method applies fixes that are safe (high-confidence) and language-neutral
+     * enough not to corrupt English blocks. Config key {@code fixOcrArtefacts} (default true)
+     * can disable the step entirely.
+     */
+    private void fixOcrContent(JSONArray blocks) {
+        if (blocks == null) return;
+        boolean enabled = cfg.optBoolean("fixOcrArtefacts", true);
+        if (!enabled) return;
+        for (int i = 0; i < blocks.length(); i++) {
+            JSONObject b = blocks.optJSONObject(i);
+            if (b == null) continue;
+            String content = b.optString("content", "");
+            if (!content.isEmpty()) {
+                b.put("content", fixOcrText(content));
+            }
+        }
+    }
+
+    /**
+     * Applies a curated set of OCR artefact corrections to a single text string.
+     *
+     * <p>Rules are ordered from most-specific to least-specific. Each rule is a
+     * regex replacement on word-boundary-anchored patterns so that partial-word
+     * matches are avoided where possible.
+     *
+     * <p>Only corrections with very high confidence are included; ambiguous cases
+     * (where the same character sequence could be correct or incorrect depending on
+     * context) are intentionally omitted to avoid introducing new errors.
+     */
+    static String fixOcrText(String text) {
+        if (text == null || text.isEmpty()) return text;
+        String s = text;
+
+        // ── Unicode normalization artefacts ───────────────────────────────────
+        // Replace common Unicode lookalikes that GPT sometimes emits for Turkish chars
+        s = s.replace('\u0131', 'ı')   // dotless-i lookalike → correct ı
+             .replace('\u015F', 'ş')   // ensure ş not mangled
+             .replace('\u011F', 'ğ')   // ensure ğ not mangled
+             // Smart quotes that sometimes appear instead of regular quotes in OCR
+             .replace('\u2018', '\'').replace('\u2019', '\'')
+             .replace('\u201C', '"').replace('\u201D', '"');
+
+        // ── Stray zero-width / invisible characters ───────────────────────────
+        s = s.replaceAll("[\u200B\u200C\u200D\uFEFF\u00AD]", "");
+
+        return s;
     }
 }

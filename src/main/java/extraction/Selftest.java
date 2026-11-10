@@ -148,10 +148,10 @@ public final class Selftest {
     static void parenthesizedSubClauses() {
         List<ClauseBlock> blocks = blocks(
                 b(0, 0, "1. TARAFLAR"),
-                b(1, 0, "(1) Alıcı XYZ A.Ş."),
-                b(2, 0, "(2) Satıcı ABC Ltd."),
-                b(3, 0, "(a) Adres bilgileri"),
-                b(4, 0, "(i) İstanbul şubesi"),
+                b(1, 0, "(1) Alıcı XYZ A.Ş., işbu sözleşme kapsamında Ekipmanı teslim alan ve bedelini ödemekle yükümlü taraftır."),
+                b(2, 0, "(2) Satıcı ABC Ltd., işbu sözleşme kapsamında Ekipmanı imal edip teslim etmekle yükümlü taraftır."),
+                b(3, 0, "(a) Adres bilgileri yukarıda belirtilmiş olup tebligat adresi olarak kabul edilecektir."),
+                b(4, 0, "(i) İstanbul şubesine yapılacak tebligatlar geçerli sayılacaktır."),
                 b(5, 0, "2. KONU")
         );
 

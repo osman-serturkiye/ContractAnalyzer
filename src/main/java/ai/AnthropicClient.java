@@ -208,4 +208,18 @@ public final class AnthropicClient extends BaseClient {
 
         return text;
     }
+
+    @Override
+    public ChatResult chatWithUsage(ChatRequest request) throws IOException {
+        // Anthropic: usage alanları "input_tokens" / "output_tokens"
+        // chat(request) response'unu yeniden almak yerine aşağıdaki özel akışı kullanıyoruz.
+        // Ancak mevcut chat() HttpJson.post çıktısını kaydetmiyor; en sade yol default'u kullanmak
+        // ve Anthropic API'sinin usage'ını doğrudan burada okumak.
+        // Not: Bu yaklaşım bir HTTP isteği daha yapmaz; chat() ile aynı isteği yapıyoruz.
+        // İleride refactor ile tek istek yapılabilir.
+        String text = chat(request);
+        // Anthropic usage'ı ayrı istek yapmadan almak için chat()'i yeniden implement etmemiz gerekir.
+        // Şimdilik -1,-1 döndürüyoruz ama Anthropic usage için gelecekte ayrıca extract edilecek.
+        return new ChatResult(text, -1, -1);
+    }
 }

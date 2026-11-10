@@ -7,6 +7,15 @@ import java.io.IOException;
 public interface AiClient {
     String chat(ChatRequest request) throws IOException;
 
+    /**
+     * Chat with provider-reported token counts (prompt + completion).
+     * Default delegates to {@link #chat(ChatRequest)} with token counts -1 (unknown).
+     * Override in providers that return usage metadata.
+     */
+    default ChatResult chatWithUsage(ChatRequest request) throws IOException {
+        return new ChatResult(chat(request), -1, -1);
+    }
+
     default boolean supportsOcr() {
         return false;
     }

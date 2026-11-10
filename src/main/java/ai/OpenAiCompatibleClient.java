@@ -97,4 +97,59 @@ public final class OpenAiCompatibleClient extends BaseClient {
         }
         return text;
     }
+
+    @Override
+    public ChatResult chatWithUsage(ChatRequest r) throws IOException {
+        // Re-use the same body-building logic by calling the internal method directly
+        JSONObject body = new JSONObject();
+        body.put("model", r.model);
+        JSONArray messages = new JSONArray();
+        if (r.system != null && !r.system.isEmpty()) {
+            messages.put(new JSONObject().put("role", "system").put("content", r.system));
+        }
+        Object content;
+        if (r.images.isEmpty()) {
+            content = r.user;
+        } else {
+            JSONArray parts = new JSONArray();
+            parts.put(new JSONObject().put("type", "text").put("text", r.user));
+            for (String img : r.images) {
+                parts.put(new JSONObject().put("type", "image_url")
+                        .put("image_url", new JSONObject().put("url", "data:image/png;base64," + img)));
+            }
+            content = parts;
+        }
+        messages.put(new JSONObject().put("role", "user").put("content", content));
+        body.put("messages", messages);
+        if (r.temperature != null) body.put("temperature", r.temperature.doubleValue());
+        if (r.maxTokens != null)   body.put(cfg.optString("maxTokensParam", "max_tokens"), r.maxTokens.intValue());
+        if (r.jsonMode && cfg.optBoolean("supportsJsonMode", true))
+            body.put("response_format", new JSONObject().put("type", "json_object"));
+
+        JSONObject resp = HttpJson.post(url(r.model), headers(), body, timeoutSec, retries);
+        if (resp.has("error") && !resp.isNull("error"))
+            throw new IOException("Provider " + name + " error: " + Json.abbreviate(resp.get("error").toString(), 500));
+        JSONArray choices = resp.optJSONArray("choices");
+        if (choices == null || choices.length() == 0)
+            throw new IOException("No choices from " + name + ": " + Json.abbreviate(resp.toString(), 500));
+        JSONObject msg = choices.getJSONObject(0).optJSONObject("message");
+        Object c = msg == null ? null : msg.opt("content");
+        String text;
+        if (c instanceof JSONArray) {
+            StringBuilder sb = new StringBuilder();
+            JSONArray arr = (JSONArray) c;
+            for (int i = 0; i < arr.length(); i++) sb.append(arr.getJSONObject(i).optString("text", ""));
+            text = sb.toString();
+        } else {
+            text = c == null || JSONObject.NULL.equals(c) ? "" : c.toString();
+        }
+        if (text.trim().isEmpty())
+            throw new IOException("Empty answer from " + name + " (model " + r.model + ")");
+
+        // Extract provider-reported token counts
+        JSONObject usage = resp.optJSONObject("usage");
+        long promptTok = usage != null ? usage.optLong("prompt_tokens", -1) : -1;
+        long completionTok = usage != null ? usage.optLong("completion_tokens", -1) : -1;
+        return new ChatResult(text, promptTok, completionTok);
+    }
 }

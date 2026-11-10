@@ -54,6 +54,24 @@ public final class PdfClauseExtractor {
     /** OCR block types that never belong to clause text. */
     private static final Set<String> SKIP_TYPES = Set.of("header", "footer");
 
+    /**
+     * Minimum character length of the text following a parenthesized marker —
+     * "(a)", "(1)", "(i)" etc. — for it to be treated as a real sub-clause heading
+     * rather than a definition-list item.
+     *
+     * <p>Definition-list items (e.g. "(a) Amerika Birleşik Devletleri;") are typically
+     * very short (< 50 chars after the token). Real sub-clauses carry a full sentence.
+     * Matching threshold in {@link extraction.ClauseTree} is identical.
+     */
+    private static final int MIN_PAREN_TAIL_CHARS = 50;
+
+    /**
+     * Maximum number of parenthesized sub-clauses accepted under one parent clause.
+     * Beyond this limit the items are treated as body text (overflow guard).
+     * Matching threshold in {@link extraction.ClauseTree} is identical.
+     */
+    private static final int MAX_PAREN_PER_PARENT = 12;
+
     private final AppConfig cfg;
     private final Router router;
 
@@ -240,13 +258,24 @@ public final class PdfClauseExtractor {
             log.info("Signed PDF [{}]: OCR mode — no native text detected, rendering {} page(s)",
                     lang, doc.pageCount());
             StepAi ocrAi = router.get("pdfPageBlockOcr");
-            float dpi = cfg.pipelineInt("renderDpi", 150);
+            // ocrRenderDpi: OCR için ayrı DPI (default 300 — native crop'tan bağımsız)
+            float dpi = cfg.pipelineInt("ocrRenderDpi", cfg.pipelineInt("renderDpi", 150));
             int id = 0;
+            int pagesFailed = 0;
             for (int p = 0; p < doc.pageCount(); p++) {
                 BufferedImage page = doc.render(p, dpi);
                 pagesOut.add(page);
 
-                JSONObject res = ocrAi.ocrBlocks(Images.toBase64Png(page));
+                JSONObject res;
+                try {
+                    res = ocrAi.ocrBlocks(Images.toBase64Png(page));
+                } catch (IOException e) {
+                    // Per-page hata toleransı: tek sayfa hatası tüm extraction'ı çökertmesin
+                    log.error("Signed PDF [{}] page {}/{}: OCR failed ({}), skipping page",
+                            lang, p + 1, doc.pageCount(), e.getMessage());
+                    pagesFailed++;
+                    continue;
+                }
                 // raw response captured BEFORE filtering — SignatureDetector needs all block types
                 if (ocrPagesOut != null) {
                     ocrPagesOut.add(res);
@@ -278,6 +307,10 @@ public final class PdfClauseExtractor {
                     }
                 }
                 log.info("Signed PDF [{}] page {}/{}: {} OCR blocks kept", lang, p + 1, doc.pageCount(), kept);
+            }
+            if (pagesFailed > 0) {
+                log.warn("Signed PDF [{}]: {} of {} page(s) failed OCR — extraction may be incomplete",
+                        lang, pagesFailed, doc.pageCount());
             }
             return false;  // OCR
         }
@@ -500,6 +533,11 @@ public final class PdfClauseExtractor {
      *       column filter in readBlocks() ensures only the target language's blocks
      *       are visible, so this case should be rare after filtering.
      *
+     *   (A3) Bare integer followed by an uppercase letter or end-of-line.
+     *       Catches OCR output where the trailing dot is dropped: "10 DEVREDİLEMEZLİK",
+     *       "12 BAĞIMSIZLIK". Guard: next char must be uppercase (\\p{Lu}) or digit so
+     *       lowercase body-text references ("see clause 3 for details") are not matched.
+     *
      *   (D) Parenthesized sub-clause markers common in English/international contracts:
      *       "(1)", "(2)", "(a)", "(b)", "(i)", "(ii)", "(iii)"
      *       These are handled specially in {@link #segmentNative}: the matched token is
@@ -511,25 +549,38 @@ public final class PdfClauseExtractor {
      * Group 1 → multi-level dotted number  (alternative A1)
      * Group 2 → single-level dotted number (alternative A2)
      * Group 3 → keyword-prefixed number    (alternative B)
-     * Group 4 → parenthesized decimal      (alternative D1)  e.g. "(1)"
-     * Group 5 → parenthesized letter       (alternative D2)  e.g. "(a)"
-     * Group 6 → parenthesized roman        (alternative D3)  e.g. "(i)"
+     * Group 4 → bare integer + uppercase   (alternative A3)
+     * Group 5 → parenthesized decimal      (alternative D1)  e.g. "(1)"
+     * Group 6 → parenthesized letter       (alternative D2)  e.g. "(a)"
+     * Group 7 → parenthesized roman        (alternative D3)  e.g. "(i)"
      */
     private static final java.util.regex.Pattern DEFAULT_CLAUSE_HEADING =
             java.util.regex.Pattern.compile(
                     // (A1) Multi-level: "1.1", "1.1.2", "10.3.1" — dot presence is the guard
+                    // Group 1
                     "^(\\d{1,4}(?:\\.\\d{1,4})+\\.?)(?:\\s|$)"
-                    // (A2) Single-level: "1." or "2." — trailing dot required, bare "1 word" rejected
+                    // (A2) Single-level trailing dot: "1." or "2."
+                    // Group 2
                     + "|^(\\d{1,4}\\.)(?:\\s|$)"
-                    // (B) Keyword prefix — Turkish: madde; English: article/section/clause; symbols: §
-                    + "|^(?:madde|article|section|clause|§)\\s+(\\d[\\d.]*)"
+                    // (B) Keyword prefix — Turkish: madde/MADDE; English: article/section/clause; §
+                    // Group 3
+                    + "|^(?:MADDE|madde|article|section|clause|§)\\s*(\\d[\\d.]*)"
+                    // (A3) Bare integer followed by an uppercase letter or end-of-line.
+                    // Catches "10 DEVREDİLEMEZLİK", "12 BAĞIMSIZLIK" etc. where OCR drops the dot.
+                    // Guard: next char must be uppercase (\\p{Lu}) or digit or EOL — prevents matching
+                    // body references like "see clause 3 for details" (lowercase follows).
+                    // Group 4
+                    + "|^(\\d{1,4})(?=\\s+[\\p{Lu}\\p{N}]|$)"
                     // (D1) Parenthesized decimal sub-clause: "(1)", "(2)", ... "(99)"
+                    // Group 5
                     + "|^\\((\\d{1,2})\\)(?:\\s|$)"
                     // (D2) Parenthesized single letter: "(a)", "(b)", ... "(z)"
+                    // Group 6
                     + "|^\\(([a-z])\\)(?:\\s|$)"
                     // (D3) Parenthesized roman numeral: "(i)", "(ii)", "(iii)", ... "(viii)"
+                    // Group 7
                     + "|^\\((i{1,3}|iv|vi{0,3}|ix|x{1,3}|xi{1,3}|xiv|xv|xvi{0,3})\\)(?:\\s|$)",
-                    java.util.regex.Pattern.CASE_INSENSITIVE);
+                    java.util.regex.Pattern.CASE_INSENSITIVE | java.util.regex.Pattern.UNICODE_CHARACTER_CLASS);
 
     /**
      * Deterministic clause segmentation for readable (native-text) PDFs.
@@ -574,18 +625,20 @@ public final class PdfClauseExtractor {
         int parenthesizedCounter = 0;
 
         for (Block b : blocks) {
-            String trimmed = b.text.trim();
+            String trimmed = extraction.ClauseNumbering.stripArtifactPrefix(b.text.trim());
             java.util.regex.Matcher m = headingPat.matcher(trimmed);
             if (m.find()) {
                 // Group 1: multi-level "1.1[.]"
                 // Group 2: single-level "1."
-                // Group 3: "Madde N" / "Section N" / "Clause N" / "Article N"
-                // Group 4: parenthesized decimal "(1)"
-                // Group 5: parenthesized letter  "(a)"
-                // Group 6: parenthesized roman   "(i)"
+                // Group 3: keyword-prefixed number "Madde N" / "Section N" / "Clause N" / "Article N"
+                // Group 4: bare integer + uppercase "10 DEVREDİLEMEZLİK"
+                // Group 5: parenthesized decimal "(1)"
+                // Group 6: parenthesized letter  "(a)"
+                // Group 7: parenthesized roman   "(i)"
                 String rawNo = m.group(1) != null ? m.group(1)
                              : m.group(2) != null ? m.group(2)
-                             : m.group(3);
+                             : m.group(3) != null ? m.group(3)
+                             : m.group(4);
 
                 if (rawNo != null) {
                     // ---- Non-parenthesized heading (groups 1-3) ----
@@ -604,30 +657,40 @@ public final class PdfClauseExtractor {
                         continue;
                     }
                 } else {
-                    // ---- Parenthesized heading (groups 4-6): synthesize sub-clause ----
+                    // ---- Parenthesized heading (groups 5-7): synthesize sub-clause ----
                     // Only synthesize when we are inside a known parent clause.
                     // The matched token itself (e.g. "(1)") is used only to anchor the
                     // ordinal; the actual sub-clause id is derived sequentially so that
                     // mixed sequences like (1)/(a)/(i) in the same clause are all mapped
                     // to consecutive parent.N numbers.
+                    //
+                    // Guard: short tail → definition-list item, not a real sub-clause.
+                    // e.g. "(a) Amerika Birleşik Devletleri;" has a tail of ~32 chars.
+                    // Real sub-clauses (e.g. "(a) ALICI, SATICI'dan Ekipman...") are 50+ chars.
+                    // Guard: overflow → more than 12 parenthesized items under one parent.
                     if (currentParent != null) {
-                        parenthesizedCounter++;
-                        String no = currentParent + "." + parenthesizedCounter;
-                        // Validate against the last accepted clause (avoids spurious splits
-                        // inside long paragraphs that happen to start with "(1)").
-                        if (ClauseNumber.isValidNextClause(currentClause, no)) {
-                            currentClause = no;
-                            found.computeIfAbsent(no, k -> new TreeSet<>());
-                            String afterNo = trimmed.substring(m.end()).trim();
-                            if (!afterNo.isEmpty()) {
-                                headingTexts.put(b.id, afterNo);
-                                found.get(currentClause).add(b.id);
+                        String afterToken = trimmed.substring(m.end()).trim();
+                        boolean shortTail     = afterToken.length() < MIN_PAREN_TAIL_CHARS;
+                        boolean counterOverflow = parenthesizedCounter >= MAX_PAREN_PER_PARENT;
+                        if (!shortTail && !counterOverflow) {
+                            parenthesizedCounter++;
+                            String no = currentParent + "." + parenthesizedCounter;
+                            // Validate against the last accepted clause (avoids spurious splits
+                            // inside long paragraphs that happen to start with "(1)").
+                            if (ClauseNumber.isValidNextClause(currentClause, no)) {
+                                currentClause = no;
+                                found.computeIfAbsent(no, k -> new TreeSet<>());
+                                if (!afterToken.isEmpty()) {
+                                    headingTexts.put(b.id, afterToken);
+                                    found.get(currentClause).add(b.id);
+                                }
+                                continue;
+                            } else {
+                                // Validation failed — treat as body text, undo counter increment
+                                parenthesizedCounter--;
                             }
-                            continue;
-                        } else {
-                            // Validation failed — treat as body text, undo counter increment
-                            parenthesizedCounter--;
                         }
+                        // Falls through to body-block handling below
                     }
                 }
             }
@@ -684,7 +747,7 @@ public final class PdfClauseExtractor {
 
     private JSONObject segmentAndCrop(List<Block> blocks, List<BufferedImage> pages, String lang) throws IOException {
         StepAi segAi = router.get("clauseSegmentationPDFSignedDocument");
-        int chunkChars = cfg.pipelineInt("docxChunkChars", 24000);
+        int chunkChars = cfg.pipelineInt("pdfChunkChars", cfg.pipelineInt("docxChunkChars", 24000));
 
         Map<String, TreeSet<Integer>> found = new LinkedHashMap<>();
         String title = "";
@@ -725,8 +788,13 @@ public final class PdfClauseExtractor {
                 if (no == null) {
                     continue;
                 }
-                if (!ClauseNumber.isValidNextClause(prev.isEmpty() ? null : prev, no)) {
-                    log.debug("Signed PDF [{}] clause {} rejected — not a valid successor of '{}'", lang, no, prev);
+                // Sadece INVALID reddedilir — VALID, DUPLICATE, RESET, BACKWARD kabul edilir.
+                // (DocxClauseExtractor ile aynı strateji: AI atıfları filtrelemeli,
+                //  Java over-validate ederek geçerli maddeleri yutmamalı.)
+                extraction.ClauseNumbering.Relation rel =
+                        extraction.ClauseNumbering.classify(prev.isEmpty() ? null : prev, no);
+                if (rel == extraction.ClauseNumbering.Relation.INVALID) {
+                    log.debug("Signed PDF [{}] clause {} rejected ({}) — prev='{}'", lang, no, rel, prev);
                     continue;
                 }
                 // Reuses DocxClauseExtractor's id/range parser ("3-5,8" | [3,4,5] | ["3-5"]) - same package.
@@ -746,6 +814,38 @@ public final class PdfClauseExtractor {
         if (chunksTotal > 0 && chunksFailed == chunksTotal) {
             throw new IOException("Signed PDF [" + lang + "] segmentation: all " + chunksTotal
                     + " chunk(s) failed — see earlier warnings for details");
+        }
+
+        // ── Deterministic supplement: LLM'in kaçırabileceği maddeleri yakala ──
+        // OCR bloklarını ClauseBlock'a çevir, deterministik motoru çalıştır,
+        // LLM'in bulmadığı maddeleri ekle (LLM pass-1 wins).
+        int detSupplementCount = 0;
+        try {
+            List<extraction.ClauseBlock> detBlocks = new ArrayList<>();
+            for (Block b : blocks) {
+                detBlocks.add(new extraction.ClauseBlock(b.id, b.page, b.text,
+                        extraction.ClauseBlock.Source.OCR_BLOCK, -1,
+                        b.x0, b.y0, b.x1, b.y1));
+            }
+            extraction.ClauseExtraction.ExtractionResult detResult =
+                    extraction.ClauseExtraction.fromOcrBlocks(detBlocks, lang);
+            for (String no : detResult.clauses.keySet()) {
+                if (!found.containsKey(no)) {
+                    // Deterministik motor bu maddeyi buldu ama LLM bulamadı
+                    List<Integer> detBlockIds = detResult.blocksByClause.get(no);
+                    if (detBlockIds != null && !detBlockIds.isEmpty()) {
+                        found.put(no, new TreeSet<>(detBlockIds));
+                        detSupplementCount++;
+                        log.info("Signed PDF [{}] deterministik supplement: madde {} bulundu (LLM kaçırmış)",
+                                lang, no);
+                    }
+                }
+            }
+        } catch (Exception e) {
+            log.debug("Signed PDF [{}] deterministik supplement hatası: {}", lang, e.getMessage());
+        }
+        if (detSupplementCount > 0) {
+            log.info("Signed PDF [{}]: {} ek madde deterministik motor ile bulundu", lang, detSupplementCount);
         }
 
         Map<Integer, Block> byId = new LinkedHashMap<>();
@@ -932,6 +1032,10 @@ public final class PdfClauseExtractor {
                 .append("Segment the blocks into numbered clauses and sub-clauses (e.g. 1, 1.1, 1.2, 2.3.4).\n")
                 .append("IMPORTANT: Every sub-clause (e.g. \"1.1\", \"1.2\") MUST be returned as a SEPARATE entry ")
                 .append("with its own \"number\" and \"blocks\". Do NOT merge sub-clauses into their parent clause.\n")
+                .append("PARENTHESIZED ITEMS: \"(a)\", \"(b)\", \"(1)\", \"(2)\" etc. are sub-clauses ONLY when substantive ")
+                .append("(full obligation/condition, typically 50+ characters). Short definition-list items like ")
+                .append("\"(a) United States;\", \"(b) United Kingdom;\", \"(a) Amerika Birleşik Devletleri;\" ")
+                .append("are NOT sub-clauses — assign them to the parent clause body, NOT as separate numbered entries.\n")
                 .append("For each clause return:\n")
                 .append(" - number: digits and dots only, exactly as printed (e.g. \"1\", \"1.1\", \"1.2\", \"2.3.4\")\n")
                 .append(" - blocks: ids of ALL blocks that belong to that clause's OWN text, as a compact string of ")
@@ -1108,7 +1212,7 @@ public final class PdfClauseExtractor {
         java.util.regex.Pattern headingPat = buildClauseHeadingPattern();
 
         for (Block b : blocks) {
-            String trimmed = b.text.trim();
+            String trimmed = extraction.ClauseNumbering.stripArtifactPrefix(b.text.trim());
 
             // 1. Check exact-prefix match against any expected clause number (dotted notation)
             String exactMatch = matchExpectedPrefix(trimmed, expectedNos);
@@ -1130,10 +1234,11 @@ public final class PdfClauseExtractor {
             if (m.find()) {
                 String rawNo = m.group(1) != null ? m.group(1)
                              : m.group(2) != null ? m.group(2)
-                             : m.group(3);
+                             : m.group(3) != null ? m.group(3)
+                             : m.group(4);
 
                 if (rawNo != null) {
-                    // ---- Non-parenthesized heading (groups 1-3) ----
+                    // ---- Non-parenthesized heading (groups 1-4) ----
                     String no = ClauseNumber.normalize(rawNo);
                     if (no != null) {
                         boolean validSuccessor = ClauseNumber.isValidNextClause(currentClause, no);
@@ -1152,24 +1257,30 @@ public final class PdfClauseExtractor {
                         }
                     }
                 } else {
-                    // ---- Parenthesized heading (groups 4-6) ----
+                    // ---- Parenthesized heading (groups 5-7) ----
                     // Synthesize parent.N and check if it is in the expected set.
+                    // Guard: short tail or counter overflow → definition-list item, skip.
                     if (currentParent != null) {
-                        int tentativeCounter = parenthesizedCounter + 1;
-                        String no = currentParent + "." + tentativeCounter;
-                        boolean validSuccessor = ClauseNumber.isValidNextClause(currentClause, no);
-                        boolean isExpected = expectedNos.contains(no);
-                        if (validSuccessor || isExpected) {
-                            parenthesizedCounter = tentativeCounter;
-                            currentClause = no;
-                            found.computeIfAbsent(no, k -> new TreeSet<>());
-                            String afterNo = trimmed.substring(m.end()).trim();
-                            if (!afterNo.isEmpty()) {
-                                headingTexts.put(b.id, afterNo);
-                                found.get(currentClause).add(b.id);
+                        String afterToken = trimmed.substring(m.end()).trim();
+                        boolean shortTail       = afterToken.length() < MIN_PAREN_TAIL_CHARS;
+                        boolean counterOverflow = parenthesizedCounter >= MAX_PAREN_PER_PARENT;
+                        if (!shortTail && !counterOverflow) {
+                            int tentativeCounter = parenthesizedCounter + 1;
+                            String no = currentParent + "." + tentativeCounter;
+                            boolean validSuccessor = ClauseNumber.isValidNextClause(currentClause, no);
+                            boolean isExpected = expectedNos.contains(no);
+                            if (validSuccessor || isExpected) {
+                                parenthesizedCounter = tentativeCounter;
+                                currentClause = no;
+                                found.computeIfAbsent(no, k -> new TreeSet<>());
+                                if (!afterToken.isEmpty()) {
+                                    headingTexts.put(b.id, afterToken);
+                                    found.get(currentClause).add(b.id);
+                                }
+                                continue;
                             }
-                            continue;
                         }
+                        // Falls through to body-block handling below
                     }
                 }
             }
@@ -1252,14 +1363,39 @@ public final class PdfClauseExtractor {
     private JSONObject segmentAndCropGuided(List<Block> blocks, List<BufferedImage> pages,
                                              String lang, java.util.Set<String> expectedNos)
             throws IOException {
-        StepAi segAi = router.get("clauseSegmentationPDFSignedDocument");
-        int chunkChars = cfg.pipelineInt("docxChunkChars", 24000);
+        Map<String, TreeSet<Integer>> found = new LinkedHashMap<>();
 
-        List<String> sortedMissing = new ArrayList<>(expectedNos);
+        // ── Deterministic exact-prefix pre-pass: LLM çağrısı olmadan açık eşleşmeleri bul ──
+        // Her bloğun metninin beklenen madde numaralarından biriyle başlayıp başlamadığını kontrol et.
+        // Örn. blok "10.1. ..." ile başlıyorsa ve "10.1" expectedNos içinde varsa → direkt eşleştir.
+        for (Block b : blocks) {
+            String trimmed = b.text.trim();
+            String match = matchExpectedPrefix(trimmed, expectedNos);
+            if (match != null) {
+                found.computeIfAbsent(match, k -> new TreeSet<>()).add(b.id);
+            }
+        }
+        int detFound = found.size();
+        if (detFound > 0) {
+            log.info("Signed PDF [{}] guided OCR pre-pass: {} clause(s) found deterministically (no LLM call needed)",
+                    lang, detFound);
+        }
+
+        // LLM pass for remaining missing clauses
+        java.util.Set<String> stillMissing = new java.util.LinkedHashSet<>(expectedNos);
+        stillMissing.removeAll(found.keySet());
+        if (stillMissing.isEmpty()) {
+            // All found deterministically — skip LLM
+            return assembleGuided(found, blocks, pages, lang, expectedNos.size());
+        }
+
+        StepAi segAi = router.get("clauseSegmentationPDFSignedDocument");
+        int chunkChars = cfg.pipelineInt("pdfChunkChars", cfg.pipelineInt("docxChunkChars", 24000));
+
+        List<String> sortedMissing = new ArrayList<>(stillMissing);
         sortedMissing.sort(ClauseNumber.COMPARATOR);
         String missingList = String.join(", ", sortedMissing);
 
-        Map<String, TreeSet<Integer>> found = new LinkedHashMap<>();
         String title = "";
         String prev = "";
 
@@ -1286,6 +1422,7 @@ public final class PdfClauseExtractor {
                     log.debug("Signed PDF [{}] guided: ignoring {} — not in expected set", lang, no);
                     continue;
                 }
+                if (found.containsKey(no)) continue;   // deterministic pre-pass wins
                 List<Integer> ids = DocxClauseExtractor.parseIds(c.opt("blocks"), blocks.size());
                 if (ids.isEmpty()) continue;
                 found.computeIfAbsent(no, k -> new TreeSet<>()).addAll(ids);
@@ -1293,6 +1430,12 @@ public final class PdfClauseExtractor {
             }
         }
 
+        return assembleGuided(found, blocks, pages, lang, expectedNos.size());
+    }
+
+    /** Assembly helper for guided pass — shared by deterministic pre-pass and LLM pass. */
+    private JSONObject assembleGuided(Map<String, TreeSet<Integer>> found, List<Block> blocks,
+                                       List<BufferedImage> pages, String lang, int expectedCount) throws IOException {
         Map<Integer, Block> byId = new LinkedHashMap<>();
         for (Block b : blocks) byId.put(b.id, b);
 
@@ -1312,7 +1455,7 @@ public final class PdfClauseExtractor {
             clauses.put(e.getKey(), c);
         }
         log.info("Signed PDF [{}] guided OCR pass — {}/{} missing clause(s) recovered",
-                lang, clauses.length(), expectedNos.size());
+                lang, clauses.length(), expectedCount);
         return new JSONObject().put("clauses", clauses);
     }
 
