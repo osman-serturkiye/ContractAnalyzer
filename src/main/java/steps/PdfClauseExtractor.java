@@ -929,7 +929,8 @@ public final class PdfClauseExtractor {
         Map<Integer, Block> byId = new LinkedHashMap<>();
         for (Block b : blocks) byId.put(b.id, b);
 
-        JSONObject clauses = new JSONObject();
+        // Build resolved block lists first (needed for both content and crops)
+        Map<String, List<Block>> clauseBlockMap = new LinkedHashMap<>();
         for (Map.Entry<String, TreeSet<Integer>> e : found.entrySet()) {
             List<Block> own = new ArrayList<>();
             for (int id : e.getValue()) {
@@ -942,18 +943,27 @@ public final class PdfClauseExtractor {
                         ? new Block(b.id, b.page, b.type, override, b.x0, b.y0, b.x1, b.y1)
                         : b);
             }
-            if (own.isEmpty()) continue;
+            if (!own.isEmpty()) clauseBlockMap.put(e.getKey(), own);
+        }
 
+        // Crop all clauses page-by-page, releasing each page from memory as soon as its
+        // crops are done — avoids holding all rendered pages alive simultaneously.
+        int pad = cfg.pipelineInt("cropPaddingPx", 8);
+        Map<String, BufferedImage> crops = cropAllClauses(clauseBlockMap, pages, pad);
+        // pages list is now fully nulled by cropAllClauses
+
+        JSONObject clauses = new JSONObject();
+        for (Map.Entry<String, List<Block>> e : clauseBlockMap.entrySet()) {
+            List<Block> own = e.getValue();
             JSONObject c = new JSONObject();
             c.put("signed_content", content(own, true));  // plain text from PDFBox — escape Markdown special chars
-            BufferedImage img = cropClause(own, pages);
+            BufferedImage img = crops.get(e.getKey());
             if (img != null) c.put("signed_image", Images.toBase64Png(img));
             c.put("bboxes", bboxes(own));
             clauses.put(e.getKey(), c);
         }
         log.info("Signed PDF [{}]: {} clauses found deterministically from {} native blocks",
                 lang, clauses.length(), blocks.size());
-        releasePages(pages);
         return new JSONObject().put("title", title).put("clauses", clauses);
     }
 
@@ -1113,21 +1123,29 @@ public final class PdfClauseExtractor {
             byId.put(b.id, b);
         }
 
-        JSONObject clauses = new JSONObject();
+        // Build resolved block lists first (needed for both content and crops)
+        Map<String, List<Block>> clauseBlockMap = new LinkedHashMap<>();
         for (Map.Entry<String, TreeSet<Integer>> e : found.entrySet()) {
             List<Block> own = new ArrayList<>();
             for (int id : e.getValue()) {
                 Block b = byId.get(id);
-                if (b != null) {
-                    own.add(b);
-                }
+                if (b != null) own.add(b);
             }
-            if (own.isEmpty()) {
-                continue;
-            }
+            if (!own.isEmpty()) clauseBlockMap.put(e.getKey(), own);
+        }
+
+        // Crop all clauses page-by-page, releasing each page from memory as soon as its
+        // crops are done — avoids holding all rendered pages alive simultaneously.
+        int pad = cfg.pipelineInt("cropPaddingPx", 8);
+        Map<String, BufferedImage> crops = cropAllClauses(clauseBlockMap, pages, pad);
+        // pages list is now fully nulled by cropAllClauses
+
+        JSONObject clauses = new JSONObject();
+        for (Map.Entry<String, List<Block>> e : clauseBlockMap.entrySet()) {
+            List<Block> own = e.getValue();
             JSONObject c = new JSONObject();
             c.put("signed_content", content(own, false));  // OCR blocks already Markdown (Mistral)
-            BufferedImage img = cropClause(own, pages);
+            BufferedImage img = crops.get(e.getKey());
             if (img != null) {
                 c.put("signed_image", Images.toBase64Png(img));
             }
@@ -1135,7 +1153,6 @@ public final class PdfClauseExtractor {
             clauses.put(e.getKey(), c);
         }
         log.info("Signed PDF [{}]: {} clauses segmented from {} OCR blocks", lang, clauses.length(), blocks.size());
-        releasePages(pages);
         return new JSONObject().put("title", title).put("clauses", clauses);
     }
 
@@ -1288,7 +1305,7 @@ public final class PdfClauseExtractor {
         Map<Integer, Set<String>> pageToClauseNos = new TreeMap<>();
         for (Map.Entry<String, List<Block>> e : clauseBlocks.entrySet()) {
             for (Block b : e.getValue()) {
-                pageToClauseNos.computeIfAbsent(b.page, k -> new LinkedHashSet<>()).add(e.getKey());
+                pageToClauseNos.computeIfAbsent(b.page, k -> new java.util.LinkedHashSet<>()).add(e.getKey());
             }
         }
 
@@ -1682,7 +1699,8 @@ public final class PdfClauseExtractor {
         Map<Integer, Block> byId = new LinkedHashMap<>();
         for (Block b : blocks) byId.put(b.id, b);
 
-        JSONObject clauses = new JSONObject();
+        // Build resolved block lists
+        Map<String, List<Block>> clauseBlockMap = new LinkedHashMap<>();
         for (Map.Entry<String, TreeSet<Integer>> e : found.entrySet()) {
             List<Block> own = new ArrayList<>();
             for (int id : e.getValue()) {
@@ -1693,10 +1711,19 @@ public final class PdfClauseExtractor {
                         ? new Block(b.id, b.page, b.type, override, b.x0, b.y0, b.x1, b.y1)
                         : b);
             }
-            if (own.isEmpty()) continue;
+            if (!own.isEmpty()) clauseBlockMap.put(e.getKey(), own);
+        }
+
+        // Crop page-by-page, releasing each page immediately after its crops are done
+        int pad = cfg.pipelineInt("cropPaddingPx", 8);
+        Map<String, BufferedImage> crops = cropAllClauses(clauseBlockMap, pages, pad);
+
+        JSONObject clauses = new JSONObject();
+        for (Map.Entry<String, List<Block>> e : clauseBlockMap.entrySet()) {
+            List<Block> own = e.getValue();
             JSONObject c = new JSONObject();
             c.put("signed_content", content(own, true));
-            BufferedImage img = cropClause(own, pages);
+            BufferedImage img = crops.get(e.getKey());
             if (img != null) c.put("signed_image", Images.toBase64Png(img));
             c.put("bboxes", bboxes(own));
             clauses.put(e.getKey(), c);
@@ -1824,17 +1851,27 @@ public final class PdfClauseExtractor {
         Map<Integer, Block> byId = new LinkedHashMap<>();
         for (Block b : blocks) byId.put(b.id, b);
 
-        JSONObject clauses = new JSONObject();
+        // Build resolved block lists
+        Map<String, List<Block>> clauseBlockMap = new LinkedHashMap<>();
         for (Map.Entry<String, TreeSet<Integer>> e : found.entrySet()) {
             List<Block> own = new ArrayList<>();
             for (int id : e.getValue()) {
                 Block b = byId.get(id);
                 if (b != null) own.add(b);
             }
-            if (own.isEmpty()) continue;
+            if (!own.isEmpty()) clauseBlockMap.put(e.getKey(), own);
+        }
+
+        // Crop page-by-page, releasing each page immediately after its crops are done
+        int pad = cfg.pipelineInt("cropPaddingPx", 8);
+        Map<String, BufferedImage> crops = cropAllClauses(clauseBlockMap, pages, pad);
+
+        JSONObject clauses = new JSONObject();
+        for (Map.Entry<String, List<Block>> e : clauseBlockMap.entrySet()) {
+            List<Block> own = e.getValue();
             JSONObject c = new JSONObject();
             c.put("signed_content", content(own, false));
-            BufferedImage img = cropClause(own, pages);
+            BufferedImage img = crops.get(e.getKey());
             if (img != null) c.put("signed_image", Images.toBase64Png(img));
             c.put("bboxes", bboxes(own));
             clauses.put(e.getKey(), c);
