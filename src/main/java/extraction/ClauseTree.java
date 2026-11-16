@@ -206,12 +206,23 @@ public final class ClauseTree {
         List<Segment>  segments    = new ArrayList<>();
         List<String>   diagnostics = new ArrayList<>();
 
+        // ── Doküman numaralandırma stili tespiti ──────────────────────────────
+        // İlk pass: tüm bloklardan ham metin al, stili tespit et.
+        // Bu adım tek geçişle O(N) — sonra asıl segmentasyon o stille yapılır.
+        List<String> allTexts = new ArrayList<>(blocks.size());
+        for (ClauseBlock b : blocks) {
+            allTexts.add(TextClean.clean(b.text));
+        }
+        ClauseNumbering.DocStyle docStyle = ClauseNumbering.detectStyle(allTexts);
+        diagnostics.add("DOC_STYLE=" + docStyle);
+
         Segment  curSeg     = new Segment(0, "");
         segments.add(curSeg);
 
         String   currentNo  = null;   // en son kabul edilen numera (segment-local)
         String   currentParent = null; // son EXPLICIT parent (parantezli alt madde için)
         int      parenCounter  = 0;   // parantezli alt madde sayacı
+        String   lastParenNorm = null; // son kabul edilen parantezli öğenin normalized değeri
 
         for (ClauseBlock block : blocks) {
             String text = TextClean.clean(block.text).trim();
@@ -228,6 +239,18 @@ public final class ClauseTree {
             if (pr == null) {
                 // Gövde bloğu: mevcut maddeye ekle
                 appendToCurrentClause(curSeg, currentNo, block.id);
+                continue;
+            }
+
+            // ── Stil filtresi ────────────────────────────────────────────────
+            // EXPLICIT heading, tespit edilen doküman stiliyle uyumsuzsa gövde olarak ekle.
+            // Parantezli sub-clause'lar her zaman kabul edilir.
+            if (pr.kind == ClauseNumbering.Kind.EXPLICIT
+                    && !ClauseNumbering.matchesStyle(pr, docStyle)) {
+                appendToCurrentClause(curSeg, currentNo, block.id);
+                diagnostics.add("STYLE_SKIP block=" + block.id
+                        + " style=" + docStyle
+                        + " raw='" + pr.raw + "' normalized=" + pr.normalized);
                 continue;
             }
 
@@ -261,7 +284,20 @@ public final class ClauseTree {
                             + " counter=" + parenCounter);
                     continue;
                 }
+                // Guard 3: Seri sıfırlama — bağımsız yeni seri tespiti.
+                // Kural: gelen öğe seri-ilki (a/1/i) VE önceki öğe seri-sonu değilse
+                // (yani önceki öğe seri-ilki ise — karma (1)(2)(a) tipinde) → sıfırlama YOK.
+                // Sadece önceki tip ile gelen tip arasında BİTİŞ+YENİDEN BAŞLAMA varsa sıfırla.
+                // Örn: "(a)(b)(c) ... (a)" → önceki "c", gelen "a" → yeni seri → sıfırla.
+                // Örn: "(1)(2)(a)" → önceki "2", gelen "a" → karma seri, sıfırlama YOK.
+                if (parenCounter > 0 && isSeriesRestart(pr.normalized, lastParenNorm)) {
+                    parenCounter = 0;
+                    diagnostics.add("PAREN_RESET block=" + block.id
+                            + " parent=" + currentParent
+                            + " prev='" + lastParenNorm + "' cur='" + pr.normalized + "' — new series");
+                }
                 parenCounter++;
+                lastParenNorm = pr.normalized;
                 candidateNo = currentParent + "." + parenCounter;
             } else {
                 candidateNo = pr.normalized;
@@ -408,6 +444,39 @@ public final class ClauseTree {
     private static String parentOf(String no) {
         int lastDot = no.lastIndexOf('.');
         return lastDot > 0 ? no.substring(0, lastDot) : null;
+    }
+
+    /**
+     * Parantezli serinin yeniden başlayıp başlamadığını kontrol eder.
+     *
+     * <p>Kural: gelen normalized değer "1", "a" veya "i" (ilk sıradaki eleman) VE
+     * mevcut sayaç 1'den büyükse → önceki seri bitmiş, yeni seri başlıyor → sayaç sıfırla.
+     *
+     * <p>Örnek: 8.2 altında "(a)(b)(c)" → sayaç 3; ardından "(a)" gelir → yeni seri → sıfırla.
+     * <p>Fark: "(1)(2)(a)" → sayaç=2 iken "(a)" gelir; tip geçişinde sıfırlama YOK —
+     * sıfırlama sadece aynı tip tekrar başa dönünce (sayaç > 1 VE ilk eleman) uygulanır.
+     */
+    private static boolean isSeriesRestart(String incoming, String lastNorm) {
+        if (incoming == null || lastNorm == null) return false;
+        // Gelen öğe seri-başlangıcı mı?
+        boolean incomingIsFirst = "1".equals(incoming) || "a".equals(incoming) || "i".equals(incoming);
+        if (!incomingIsFirst) return false;
+        // Önceki öğe sayısal ise karma seri — sıfırlama yok (örn. "(1)(2)(a)")
+        if (lastNorm.matches("\\d+")) return false;
+        // Gelen "i" (roman) ise: önceki harf ile karma seri olabilir ("(a)...(i)") → sıfırlama yok
+        if ("i".equals(incoming)) return false;
+        // Gelen "a" (harf): önceki sadece büyük harf olmayan latin harfse sıfırla
+        // Önceki "b","c","d"... → yeni seri; önceki "i","ii"... roman → karma seri
+        if ("a".equals(incoming)) {
+            // önceki roman numeral ise karma seri
+            if (lastNorm.matches("[ivxlcdm]+") && !lastNorm.equals("a") && !lastNorm.equals("b")) {
+                return false;
+            }
+            // önceki "b" veya sonraki harfse yeni seri
+            return !lastNorm.equals("a");  // önceki 'a' değilse (seri ortasında tekrar 'a' değil)
+        }
+        // "1" ile yeniden başlama: önceki sayısal değilse yeni seri
+        return true;
     }
 
     private static String abbreviate(String s, int max) {

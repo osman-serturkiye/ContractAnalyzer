@@ -1,5 +1,7 @@
 package steps;
 
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
@@ -18,6 +20,7 @@ import java.util.TreeSet;
  * The first document is the baseline (signed if present, otherwise original1).
  */
 public final class AnalyzeMerger {
+    private static final Logger log = LogManager.getLogger(AnalyzeMerger.class);
     private final double renumberThreshold;
 
     public AnalyzeMerger(double renumberThreshold) {
@@ -111,6 +114,32 @@ public final class AnalyzeMerger {
                 }
                 clauses.put(no, c);
             }
+
+            // ── S# segment removal ───────────────────────────────────────────────────
+            // S#-prefixed keys (e.g. "S6#2", "S8#1", "S11#2") come from the signed PDF's
+            // deterministic supplement opening new segments for tables/annexes/specs.
+            // These segments originate from non-contract pages (equipment specs, notary
+            // text, signature blocks) and their "clause numbers" are false positives —
+            // numbers found in table cells, ID numbers, prices, etc.
+            //
+            // Previously these were absorbed into the last normal clause, but this caused
+            // garbage content (e.g. "10 gün", "2 yıl", "POMPAYI KONTROL EDEN TEK") to be
+            // appended to real clauses — a fraud detection false positive.
+            //
+            // Now: S# segments are DROPPED entirely. If the signed PDF has genuine
+            // additional clauses (annexes), the LLM segmentation finds them with real
+            // clause numbers — the deterministic supplement's S# segments are always noise.
+            List<String> sKeysToRemove = new ArrayList<>();
+            for (String no : clauses.keySet()) {
+                if (no.contains("#")) {
+                    sKeysToRemove.add(no);
+                    log.info("Merge [{}]: S# segment key '{}' dropped (non-contract page content)", lang, no);
+                }
+            }
+            for (String k : sKeysToRemove) {
+                clauses.remove(k);
+            }
+
             analyze.put(lang, new JSONObject().put("clauses", clauses));
         }
         analyze.put("baselines", baselines);
@@ -127,41 +156,59 @@ public final class AnalyzeMerger {
     }
 
     /**
-     * Clauses that exist only in one of the two documents are matched by text similarity; if similar enough the
-     * "other" clause is re-keyed to the baseline number. Returns newNo -> oldNo.
+     * Clauses that exist only in one of the two documents are matched by text similarity;
+     * if similar enough the "other" clause is re-keyed to the baseline number.
+     * Returns newNo -> oldNo (baseline number → original other-doc number).
+     *
+     * <p>Threshold default: 0.92 (raised from 0.85 to reduce false renumber matches
+     * between similar-looking standard clauses that are actually distinct).
+     *
+     * <p>Side effect: mutates {@code other} and {@code otherImages} in-place
+     * (defensive copies are taken so the caller's maps are not affected).
      */
     Map<String, String> realign(Map<String, String> base, Map<String, String> other, Map<String, String> otherImages) {
+        // Defensive copies — do not mutate caller's maps directly
+        Map<String, String> otherCopy  = new java.util.LinkedHashMap<>(other);
+        Map<String, String> imagesCopy = otherImages != null
+                ? new java.util.LinkedHashMap<>(otherImages) : null;
+
         Map<String, String> moved = new LinkedHashMap<>();
         List<String> onlyOther = new ArrayList<>();
-        for (String k : other.keySet()) {
-            if (!base.containsKey(k)) {
-                onlyOther.add(k);
-            }
+        for (String k : otherCopy.keySet()) {
+            if (!base.containsKey(k)) onlyOther.add(k);
         }
         List<String> onlyBase = new ArrayList<>();
         for (String k : base.keySet()) {
-            if (!other.containsKey(k)) {
-                onlyBase.add(k);
-            }
+            if (!otherCopy.containsKey(k)) onlyBase.add(k);
         }
         for (String o : onlyOther) {
             String best = null;
             double bestSim = renumberThreshold;
             for (String b : onlyBase) {
-                double sim = ClauseDiffer.similarity(base.get(b), other.get(o));
+                double sim = ClauseDiffer.similarity(base.get(b), otherCopy.get(o));
                 if (sim >= bestSim) {
                     bestSim = sim;
                     best = b;
                 }
             }
             if (best != null) {
-                other.put(best, other.remove(o));
-                if (otherImages != null && otherImages.containsKey(o)) {
-                    otherImages.put(best, otherImages.remove(o));
+                otherCopy.put(best, otherCopy.remove(o));
+                if (imagesCopy != null && imagesCopy.containsKey(o)) {
+                    imagesCopy.put(best, imagesCopy.remove(o));
                 }
                 onlyBase.remove(best);
                 moved.put(best, o);
+                log.warn("AnalyzeMerger realign: madde '{}' (diğer dok.) → '{}' (baseline) olarak eşleştirildi " +
+                        "(benzerlik={}) — gerçek madde numarası değişikliği olabilir, raporda kontrol edin.",
+                        o, best, String.format("%.3f", bestSim));
             }
+        }
+        // Apply mutations back to the caller's maps
+        other.clear();
+        other.putAll(otherCopy);
+        if (otherImages != null && imagesCopy != null) {
+            otherImages.clear();
+            otherImages.putAll(imagesCopy);
         }
         return moved;
     }

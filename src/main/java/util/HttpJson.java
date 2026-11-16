@@ -23,13 +23,146 @@ public final class HttpJson {
     private HttpJson() {
     }
 
+    /**
+     * GETs a URL and returns the parsed JSON response.
+     * Used for polling asynchronous OCR operations.
+     */
+    public static JSONObject get(String url, Map<String, String> headers,
+                                 int timeoutSec, int maxRetries) throws IOException {
+        IOException last = null;
+        for (int attempt = 0; attempt <= maxRetries; attempt++) {
+            if (attempt > 0) {
+                long base = Math.min(30000L, 1000L * (1L << attempt));
+                long jitter = (long) (base * 0.3 * ThreadLocalRandom.current().nextDouble());
+                long wait = base + jitter;
+                log.warn("GET Retry {}/{} in {} ms ({})", attempt, maxRetries, wait,
+                        last == null ? "" : last.getMessage());
+                try {
+                    Thread.sleep(wait);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    throw new IOException("Interrupted", ie);
+                }
+            }
+            HttpRequest.Builder rb = HttpRequest.newBuilder(URI.create(url))
+                    .timeout(Duration.ofSeconds(timeoutSec))
+                    .GET();
+            for (Map.Entry<String, String> e : headers.entrySet()) {
+                rb.header(e.getKey(), e.getValue());
+            }
+
+            HttpResponse<String> resp;
+            try {
+                resp = CLIENT.send(rb.build(), HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                throw new IOException("Interrupted", ie);
+            } catch (IOException ioe) {
+                last = ioe;
+                continue;
+            }
+            int sc = resp.statusCode();
+            if (sc >= 200 && sc < 300) {
+                return new JSONObject(resp.body());
+            }
+            String msg = "HTTP " + sc + " from " + URI.create(url).getHost() + ": "
+                    + Json.abbreviate(resp.body(), 500);
+            if (sc == 429 || sc >= 500) {
+                last = new IOException(msg);
+                continue;
+            }
+            throw new IOException(msg);
+        }
+        throw last != null ? last : new IOException("GET failed: " + url);
+    }
+
+    /**
+     * POSTs raw bytes with the given content-type, retries on IO errors / 429 / 5xx.
+     * Used for providers (e.g. Azure Computer Vision) that accept image bytes directly
+     * instead of a JSON envelope.
+     */
+    public static JSONObject postBytes(String url, Map<String, String> headers, byte[] body,
+                                       String contentType, int timeoutSec, int maxRetries)
+            throws IOException {
+        IOException last = null;
+        boolean sleptViaRetryAfter = false;  // flag: Retry-After already slept, skip loop-top sleep
+        for (int attempt = 0; attempt <= maxRetries; attempt++) {
+            if (attempt > 0 && !sleptViaRetryAfter) {
+                long base = Math.min(30000L, 1000L * (1L << attempt));
+                long jitter = (long) (base * 0.3 * ThreadLocalRandom.current().nextDouble());
+                long wait = base + jitter;
+                log.warn("Retry {}/{} in {} ms ({})", attempt, maxRetries, wait,
+                        last == null ? "" : last.getMessage());
+                try {
+                    Thread.sleep(wait);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    throw new IOException("Interrupted", ie);
+                }
+            }
+            sleptViaRetryAfter = false;  // reset for next iteration
+            HttpRequest.Builder rb = HttpRequest.newBuilder(URI.create(url))
+                    .timeout(Duration.ofSeconds(timeoutSec))
+                    .header("Content-Type", contentType);
+            for (Map.Entry<String, String> e : headers.entrySet()) {
+                rb.header(e.getKey(), e.getValue());
+            }
+            rb.POST(HttpRequest.BodyPublishers.ofByteArray(body));
+
+            HttpResponse<String> resp;
+            try {
+                resp = CLIENT.send(rb.build(), HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                throw new IOException("Interrupted", ie);
+            } catch (IOException ioe) {
+                last = ioe;
+                continue;
+            }
+            int sc = resp.statusCode();
+            if (sc >= 200 && sc < 300) {
+                String responseBody = resp.body();
+                if (responseBody == null || responseBody.isBlank()) {
+                    // Some endpoints (e.g. Azure async read) return 202 with an empty body
+                    // and put the result URL in a header.  Return a wrapper with that header.
+                    String opLocation = resp.headers().firstValue("Operation-Location").orElse("");
+                    return new JSONObject().put("operationLocation", opLocation);
+                }
+                return new JSONObject(responseBody);
+            }
+            String msg = "HTTP " + sc + " from " + URI.create(url).getHost() + ": "
+                    + Json.abbreviate(resp.body(), 500);
+            if (sc == 429 || sc >= 500) {
+                last = new IOException(msg);
+                if (sc == 429 && attempt < maxRetries) {
+                    String retryAfter = resp.headers().firstValue("Retry-After").orElse("");
+                    long retryAfterMs = parseRetryAfter(retryAfter);
+                    if (retryAfterMs > 0) {
+                        log.warn("Retry-After header: waiting {} ms", retryAfterMs);
+                        try {
+                            Thread.sleep(retryAfterMs);
+                        } catch (InterruptedException ie) {
+                            Thread.currentThread().interrupt();
+                            throw new IOException("Interrupted", ie);
+                        }
+                        sleptViaRetryAfter = true;
+                    }
+                }
+                continue;
+            }
+            throw new IOException(msg);
+        }
+        throw last != null ? last : new IOException("Request failed: " + url);
+    }
+
     /** POSTs JSON, retries on IO errors / 429 / 5xx with exponential back-off + jitter.
      *  Respects Retry-After header on 429 responses. */
     public static JSONObject post(String url, Map<String, String> headers, JSONObject body,
                                   int timeoutSec, int maxRetries) throws IOException {
         IOException last = null;
+        boolean sleptViaRetryAfter = false;
         for (int attempt = 0; attempt <= maxRetries; attempt++) {
-            if (attempt > 0) {
+            if (attempt > 0 && !sleptViaRetryAfter) {
                 long base = Math.min(30000L, 1000L * (1L << attempt));
                 // Jitter ±30% — prevents thundering herd when multiple parallel steps retry at once
                 long jitter = (long) (base * 0.3 * ThreadLocalRandom.current().nextDouble());
@@ -42,6 +175,7 @@ public final class HttpJson {
                     throw new IOException("Interrupted", ie);
                 }
             }
+            sleptViaRetryAfter = false;
             HttpRequest.Builder rb = HttpRequest.newBuilder(URI.create(url))
                     .timeout(Duration.ofSeconds(timeoutSec))
                     .header("Content-Type", "application/json");
@@ -76,9 +210,9 @@ public final class HttpJson {
                         try { Thread.sleep(retryAfterMs); } catch (InterruptedException ie) {
                             Thread.currentThread().interrupt(); throw new IOException("Interrupted", ie);
                         }
-                        // Skip the standard wait at the top of the next iteration
-                        attempt++;
-                        if (attempt > maxRetries) break;
+                        // Mark that we already slept — skip the exponential backoff
+                        // at the top of the next iteration to avoid double-sleep.
+                        sleptViaRetryAfter = true;
                     }
                 }
                 continue;

@@ -82,6 +82,9 @@ public final class Router {
             case "mistral-ocr":
                 c = new MistralOcrClient(provider, pc);
                 break;
+            case "azure-cv-ocr":
+                c = new AzureCvOcrClient(provider, pc);
+                break;
             default:
                 throw new IllegalStateException("providers." + provider + ".type '" + type + "' is not supported");
         }

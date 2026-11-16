@@ -79,8 +79,15 @@ public final class MSFoundryClient extends BaseClient {
                 + "   Common confusion pairs to watch carefully:\n"
                 + "   - 'talebi' vs 'tebliği' (completely different words)\n"
                 + "   - 'talep' vs 'tebliğ' — look at ALL letters carefully\n"
+                + "   - 'testleri' vs 'teslimi' — 'test' has a 't' at the end before suffix; 'teslim' has 'slim'\n"
+                + "   - 'test' vs 'teslim' — count the letters: t-e-s-t vs t-e-s-l-i-m\n"
                 + "   - ı (dotless i) vs i (dotted i)\n"
                 + "   - ğ vs g — the curl on ğ is significant\n"
+                + "   NEGATION SUFFIX — CRITICAL: Turkish negation suffix '-me'/'-ma' changes meaning completely.\n"
+                + "   - 'etmeme' (NOT doing / failure to do) vs 'etme' (doing) — if you see 'etmeme', do NOT drop the second 'me'.\n"
+                + "   - 'yapmama' (NOT doing) vs 'yapma' (doing/instruction) — preserve the double 'ma'.\n"
+                + "   - 'vermeme' (NOT giving) vs 'verme' (giving) — look for the double suffix carefully.\n"
+                + "   - Rule: when a verb stem ends with 'me' or 'ma' and is followed by another 'me'/'ma', BOTH must appear.\n"
                 + "3. Numbers, percentages, dates and amounts must be exact (e.g. %0,5 not %0.5).\n"
                 + "4. Identify every distinct text block (headings, paragraphs, tables, list items, "
                 + "footnotes, headers, footers).\n"
@@ -584,7 +591,9 @@ public final class MSFoundryClient extends BaseClient {
             if (b == null) continue;
             String content = b.optString("content", "");
             if (!content.isEmpty()) {
-                b.put("content", fixOcrText(content));
+                String fixed = fixOcrText(content);
+                b.put("content", fixed);
+                logSuspiciousOcrWords(fixed);
             }
         }
     }
@@ -617,5 +626,42 @@ public final class MSFoundryClient extends BaseClient {
         s = s.replaceAll("[\u200B\u200C\u200D\uFEFF\u00AD]", "");
 
         return s;
+    }
+
+    // ── OCR şüpheli kelime tespiti ────────────────────────────────────────────
+
+    /**
+     * Türkçe sözleşmelerde sık karıştırılan kelime çiftleri.
+     * Bir blokta bu kelimelerden biri geçiyorsa DEBUG log'lanır;
+     * otomatik düzeltme YAPILMAZ çünkü her ikisi de geçerli Türkçe kelimedir.
+     * Temel çözüm daha yüksek render DPI'dır (pipeline.ocrRenderDpi: 200+).
+     *
+     * Özellikle dikkat: Türkçe olumsuzluk eki "-me/-ma" fiil sonuna eklenir.
+     * "etmeme" (not doing) → "etme" (doing) karışıklığı kritik anlam farkı yaratır.
+     */
+    private static final String[][] SUSPICIOUS_PAIRS = {
+        {"testleri",  "teslimi"},
+        {"teslimi",   "testleri"},
+        {"talebine",  "tebliğine"},
+        {"tebliğine", "talebine"},
+        {"talep",     "tebliğ"},
+        {"tebliğ",    "talep"},
+        {"etmeme",    "etme"},
+        {"etmeme",    "etmemek"},
+        {"yapmama",   "yapma"},
+        {"vermeme",   "verme"},
+        {"alınmama",  "alınma"},
+    };
+
+    private void logSuspiciousOcrWords(String content) {
+        if (content == null || content.isEmpty()) return;
+        String lower = content.toLowerCase(java.util.Locale.forLanguageTag("tr"));
+        for (String[] pair : SUSPICIOUS_PAIRS) {
+            if (lower.contains(pair[0])) {
+                log.debug("OCR şüpheli kelime '{}' — '{}' ile karıştırılmış olabilir. "
+                        + "Çözüm: pipeline.ocrRenderDpi artır (öneri: 200+).",
+                        pair[0], pair[1]);
+            }
+        }
     }
 }

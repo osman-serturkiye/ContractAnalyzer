@@ -10,9 +10,11 @@ import report.ReportBuilder;
 import steps.Pipeline;
 
 import java.io.File;
+import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -71,6 +73,44 @@ public class AnalyzeHelper {
         Files.writeString(output.resolve("analyze.json"), analyze.toString(2));
         Files.writeString(output.resolve("config.json"), loadConfig().toString(2));
         GeneralLib._info("Wrote " + output.resolve("analyze.json"));
+
+        // ── OCR data export ──────────────────────────────────────────────────────────
+        // Copy raw OCR results (signed extract checkpoint containing per-page OCR blocks)
+        // from work/ to results/ocr-data/ for diagnostics and audit.
+        try {
+            Path ocrDataDir = output.resolve("ocr-data");
+            Files.createDirectories(ocrDataDir);
+            Path workDir = input.resolve("work");
+            if (Files.isDirectory(workDir)) {
+                // signed.*.extract.json files contain the OCR page blocks
+                try (java.util.stream.Stream<Path> stream = Files.list(workDir)) {
+                    stream.filter(p -> p.getFileName().toString().matches("signed\\..*\\.extract.*\\.json"))
+                          .forEach(src -> {
+                              try {
+                                  Files.copy(src, ocrDataDir.resolve(src.getFileName()),
+                                          StandardCopyOption.REPLACE_EXISTING);
+                              } catch (IOException e) {
+                                  GeneralLib._info("OCR data copy warning: " + e.getMessage());
+                              }
+                          });
+                }
+                // Also export original extract checkpoints
+                try (java.util.stream.Stream<Path> stream = Files.list(workDir)) {
+                    stream.filter(p -> p.getFileName().toString().matches("original.*\\.extract\\.json"))
+                          .forEach(src -> {
+                              try {
+                                  Files.copy(src, ocrDataDir.resolve(src.getFileName()),
+                                          StandardCopyOption.REPLACE_EXISTING);
+                              } catch (IOException e) {
+                                  GeneralLib._info("OCR data copy warning: " + e.getMessage());
+                              }
+                          });
+                }
+            }
+            GeneralLib._info("OCR data exported to: " + ocrDataDir);
+        } catch (Exception e) {
+            GeneralLib._info("OCR data export failed (non-critical): " + e.getMessage());
+        }
 
 
         ReportBuilder rb = new ReportBuilder(cfg);

@@ -1233,6 +1233,7 @@ public final class ReportBuilder {
 
                 // Same data embedded directly on the card so the template
                 // can render a finding-row banner without cross-list lookups.
+                Map<String, Object> stI18nFr = verdictOrStatusI18n(st, ai, lbase, o);
                 findingRows.add(m(
                         "docLabel",        labelSpan(
                                                (String) docLabelI18n(o).get("en"),
@@ -1246,6 +1247,12 @@ public final class ReportBuilder {
                         "verdictLabel",    ai == null ? "" : labelSpan(
                                                (String) verdictLabelI18n(ai.optString("verdict","")).get("en"),
                                                (String) verdictLabelI18n(ai.optString("verdict","")).get("tr"),
+                                               print),
+                        "statusText",      verdictOrStatus(st, ai, lbase, o),
+                        "statusText_i18n", stI18nFr,
+                        "statusTextSpan",  labelSpan(
+                                               (String) stI18nFr.get("en"),
+                                               (String) stI18nFr.get("tr"),
                                                print),
                         "summary",         i18nSpan(ai == null ? null : ai.opt("summary"), print),
                         "tagDiff",         item.get("tagDiff"),
@@ -1951,8 +1958,7 @@ public final class ReportBuilder {
             boolean print
     ) {
 
-        List<Map<String, Object>> cols =
-                new ArrayList<>();
+        List<Map<String, Object>> cols = new ArrayList<>();
 
         for (String d : ldocs) {
 
@@ -1962,33 +1968,53 @@ public final class ReportBuilder {
                         (String) docLabelI18n(d).get("tr") + " (reference)")
                     : docLabelI18n(d);
 
-            cols.add(
-                    m(
-                            "label",
-                            labelSpan(
+            // For non-baseline docs: use the word-level diff HTML so that added/changed/removed
+            // words are highlighted inline (del/ins spans).  Fall back to plain md() when no diff
+            // is available (e.g. single-document view, missing clause, identical clause).
+            String html;
+            if (c.has(d + "_content")) {
+                if (!d.equals(lbase)) {
+                    // Try to get the diff-annotated markdown for this side
+                    JSONObject comparisons = c.optJSONObject("comparisons");
+                    JSONObject cmp = comparisons == null ? null : comparisons.optJSONObject(d);
+                    if (cmp != null && cmp.has("html_other_md")) {
+                        html = mdDiff(cmp.optString("html_other_md", ""));
+                    } else if (cmp != null && cmp.has("html_other")) {
+                        html = cmp.optString("html_other", "");
+                    } else {
+                        html = md(c.getString(d + "_content"));
+                    }
+                } else {
+                    // Baseline column: show diff-annotated baseline text if available from any comparison
+                    String baseHtml = null;
+                    JSONObject comparisons = c.optJSONObject("comparisons");
+                    if (comparisons != null) {
+                        for (String otherKey : comparisons.keySet()) {
+                            JSONObject cmp = comparisons.optJSONObject(otherKey);
+                            if (cmp != null && cmp.has("html_base_md")) {
+                                baseHtml = mdDiff(cmp.optString("html_base_md", ""));
+                                break;
+                            } else if (cmp != null && cmp.has("html_base")) {
+                                baseHtml = cmp.optString("html_base", "");
+                                break;
+                            }
+                        }
+                    }
+                    html = baseHtml != null ? baseHtml : md(c.getString(d + "_content"));
+                }
+            } else {
+                html = "<p class=\"muted\">&#8212;</p>";
+            }
+
+            cols.add(m(
+                    "label",   labelSpan(
                                     (String) lblI18n.get("en"),
                                     (String) lblI18n.get("tr"),
-                                    print
-                            ),
-                            "label_i18n",
-                            lblI18n,
-                            "image",
-                            c.optString(
-                                    d + "_image",
-                                    ""
-                            ),
-                            "html",
-                            c.has(
-                                    d + "_content"
-                            )
-                                    ? md(
-                                    c.getString(
-                                            d + "_content"
-                                    )
-                            )
-                                    : "<p class=\"muted\">&#8212;</p>"
-                    )
-            );
+                                    print),
+                    "label_i18n", lblI18n,
+                    "image",   c.optString(d + "_image", ""),
+                    "html",    html
+            ));
         }
 
         return cols;
@@ -2255,6 +2281,11 @@ public final class ReportBuilder {
                         "verdict",
                         ""
                 );
+
+        // AI determined the clauses are equivalent in meaning → treat as identical
+        if ("IDENTICAL".equals(verdict)) {
+            return "ok";
+        }
 
         if (
                 "FORMATTING_ONLY".equals(verdict)

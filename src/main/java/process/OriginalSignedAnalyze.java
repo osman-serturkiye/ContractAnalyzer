@@ -31,9 +31,9 @@ public class OriginalSignedAnalyze extends UnifiedAgent {
     @Override
     protected Object execute() {
         try{
-            String agentJobID = "22331328-691b-4486-90c8-5ca10a900d7a";
+            //String agentJobID = "22331328-691b-4486-90c8-5ca10a900d7a";
             //String agentJobID = GeneralLib.paramStringValue("agentJobId");
-            //String agentJobID = getAgentJobId();
+            String agentJobID = getAgentJobId();
             if(agentJobID == null || agentJobID.isBlank()){
                 return resultError(
                         "AGENT JOB ID is NULL"
@@ -56,7 +56,7 @@ public class OriginalSignedAnalyze extends UnifiedAgent {
             }
             GeneralLib._info("1-Getting Process Instance");
             IProcessInstance processInstance = eventTask.getProcessInstance();
-            String refId = processInstance.getDescriptorValue("ObjectNumberReference");
+            String refId = processInstance.getDescriptorValue("ObjectDocumentReference");
             if(refId == null){
                 throw new Exception(
                         "REFERENCE ID is NULL"

@@ -6,6 +6,7 @@ import docx.DocxReader;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
+import java.awt.image.BufferedImage;
 import java.io.File;
 import java.io.IOException;
 import java.util.ArrayList;
@@ -41,7 +42,21 @@ public final class ContractAnalyzer {
      */
     public JSONObject clauseExtractionPDFSignedDocument(File pdf, String lang,
                                                         List<JSONObject> ocrPagesOut) throws Exception {
-        return pdfExtractor.extractWithOcrPages(pdf, lang, ocrPagesOut);
+        return pdfExtractor.extractWithOcrPages(pdf, lang, ocrPagesOut, 0, null);
+    }
+
+    /**
+     * 2+3. signed PDF clause extraction with page-limit support.
+     *
+     * @param maxContentPages  process only the first N pages (0 = all pages).
+     *                         Pages beyond this limit are rendered and stored in {@code extraPagesOut}.
+     * @param extraPagesOut    if non-null, rendered images of extra pages (signature, annex) are appended here.
+     */
+    public JSONObject clauseExtractionPDFSignedDocument(File pdf, String lang,
+                                                        List<JSONObject> ocrPagesOut,
+                                                        int maxContentPages,
+                                                        List<BufferedImage> extraPagesOut) throws Exception {
+        return pdfExtractor.extractWithOcrPages(pdf, lang, ocrPagesOut, maxContentPages, extraPagesOut);
     }
 
     /**

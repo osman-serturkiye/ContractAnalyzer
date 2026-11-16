@@ -1,6 +1,7 @@
 package extraction;
 
 import java.util.Comparator;
+import java.util.List;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -472,7 +473,7 @@ public final class ClauseNumbering {
      * Markdown formatting marker'larını metnin başından ve sayıdan sonra temizler.
      * DocxReader paragraphToMarkdown() metni bold ve heading marker'lari ile sarar.
      */
-    static String stripMarkdownPrefix(String t) {
+    public static String stripMarkdownPrefix(String t) {
         if (t == null || t.isEmpty()) return t;
         // Tüm markdown bold/italic marker'larini kaldir.
         // Bu metin sadece numara tespiti icin kullanilir —
@@ -516,5 +517,123 @@ public final class ClauseNumbering {
             if (ROMAN_WORDS[i].equals(u)) return ROMAN_VALS[i];
         }
         return 0;
+    }
+
+    // ------------------------------------------------------------------
+    // Doküman numaralandırma stili
+
+    /**
+     * Bir dokümanın üst-seviye madde numaralandırma standardı.
+     *
+     * <p>Temel ilke: doküman bir standartla başlamışsa, extraction tüm boyunca
+     * o standarda sadık kalır. Birden fazla standardın aynı anda aktif olması
+     * belirsiz parse sonuçları ve yanlış segmentasyona yol açar.
+     *
+     * <p>Örnekler:
+     * <ul>
+     *   <li>NUMERIC: "1.", "2.", "1.1.", "2.3.4" — Türk/İngilizce ticari sözleşmeler</li>
+     *   <li>KEYWORD: "MADDE 1", "Article 2", "§ 3" — keyword prefix'li formatlar</li>
+     *   <li>ROMAN: "I", "II", "III" — bazı uluslararası sözleşmeler</li>
+     *   <li>UNKNOWN: henüz tespit edilmedi veya standart belirlenemedi</li>
+     * </ul>
+     */
+    public enum DocStyle {
+        /** Sayısal noktalı: "1.", "1.1", "2.3.4" */
+        NUMERIC,
+        /** Keyword prefix: "MADDE 1", "Article 2", "§ 3", "المادة 4" */
+        KEYWORD,
+        /** Roma rakamı: "I", "II", "III" */
+        ROMAN,
+        /** Tespit edilemedi — tüm formatlar geçerli */
+        UNKNOWN
+    }
+
+    /**
+     * İlk birkaç explicit heading bloğundan dokümanın numaralandırma standardını tespit eder.
+     *
+     * <p>İlk tespit edilen EXPLICIT (non-parenthesized) madde numarasının tipine göre
+     * standart belirlenir. Parantezli alt maddeler (G7-G11) hiçbir zaman standardı belirlemez.
+     *
+     * @param lines ham satır/paragraf listesi (tüm doküman veya başlangıç kısmı)
+     * @return tespit edilen {@link DocStyle}; en az 1 heading bulunamazsa {@link DocStyle#UNKNOWN}
+     */
+    public static DocStyle detectStyle(List<String> lines) {
+        int votes_numeric = 0;
+        int votes_keyword = 0;
+        int votes_roman   = 0;
+
+        for (String line : lines) {
+            if (line == null || line.isBlank()) continue;
+            String demd = stripMarkdownPrefix(line.trim());
+            if (isLegalReference(demd)) continue;
+            String cleaned = stripArtifactPrefix(demd);
+
+            Matcher m = HEADING.matcher(cleaned);
+            if (!m.find()) continue;
+
+            // Sadece EXPLICIT heading'ler standart belirler
+            if (m.group(1) != null || m.group(2) != null || m.group(3) != null) {
+                votes_numeric++;
+            } else if (m.group(4) != null || m.group(5) != null) {
+                votes_keyword++;
+            } else if (m.group(6) != null) {
+                votes_roman++;
+            }
+            // G7-G11 (parantezli) → standart belirlemiyor
+
+            // 3 oy yeterli güven
+            int max = Math.max(votes_numeric, Math.max(votes_keyword, votes_roman));
+            if (max >= 3) break;
+        }
+
+        int max = Math.max(votes_numeric, Math.max(votes_keyword, votes_roman));
+        if (max == 0) return DocStyle.UNKNOWN;
+        if (votes_numeric == max) return DocStyle.NUMERIC;
+        if (votes_keyword == max) return DocStyle.KEYWORD;
+        return DocStyle.ROMAN;
+    }
+
+    /**
+     * Verilen {@link ParseResult}'in belirtilen {@link DocStyle} ile uyumlu olup
+     * olmadığını kontrol eder.
+     *
+     * <p>Parantezli alt maddeler (PARENTHESIZED) her zaman kabul edilir — sub-clause
+     * formatı üst-seviye standarttan bağımsızdır.
+     *
+     * <p>{@link DocStyle#UNKNOWN} olduğunda her format kabul edilir (geriye dönük uyumluluk).
+     *
+     * @param pr    parse sonucu
+     * @param style dokümanın belirlenen stili
+     * @return {@code true} → bu heading doküman stiliyle uyumlu
+     */
+    public static boolean matchesStyle(ParseResult pr, DocStyle style) {
+        if (pr == null) return false;
+        if (style == DocStyle.UNKNOWN) return true;
+        // Sub-clause'lar (parantezli) her zaman geçerli
+        if (pr.kind == Kind.PARENTHESIZED) return true;
+
+        // Hangi grup eşleşti?
+        // Normalize değer sayısal+nokta formatındaysa bu NUMERIC veya KEYWORD match
+        // Roman rakam kontrolü: normalize 1-12 arası ama raw büyük harf roman
+        switch (style) {
+            case NUMERIC:
+                // G1 (multi-level), G2 (single dot), G3 (bare int) → normalize digits+dots
+                return pr.normalized.matches("\\d+(\\.\\d+)*");
+            case KEYWORD:
+                // G4 (keyword prefix) → raw MADDE/Article/§ ile başlıyor
+                // G1/G2/G3 de keyword belgelerde geçerlidir (çünkü "MADDE 3.1" → "3.1" normalize)
+                // KEYWORD belgelerinde hem keyword hem numeric geçerli sayılır
+                return true;
+            case ROMAN:
+                // G6 → raw tek büyük harf roman; normalize 1..12 ama bunlar roman kaynaklı
+                // Raw değeri bakılarak roman olup olmadığına karar verilebilir
+                // Basit yaklaşım: raw ROMAN_WORDS içindeyse roman
+                for (String w : ROMAN_WORDS) {
+                    if (w.equals(pr.raw.trim().toUpperCase())) return true;
+                }
+                return false;
+            default:
+                return true;
+        }
     }
 }

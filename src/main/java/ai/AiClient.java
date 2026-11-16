@@ -49,4 +49,57 @@ public interface AiClient {
     default JSONObject ocrBlocks(String model, String pngBase64) throws IOException {
         throw new UnsupportedOperationException("Block OCR not supported by this provider");
     }
+
+    /**
+     * Whether this provider supports whole-document PDF OCR (sending the PDF file in one request).
+     * When true, {@link #ocrPdfBlocks} is used instead of rendering + calling {@link #ocrBlocks}
+     * once per page.
+     */
+    default boolean supportsPdfOcr() {
+        return false;
+    }
+
+    /**
+     * Whole-document OCR: submit the raw PDF bytes once and receive per-page block data.
+     *
+     * <p>Output contract — a JSON array, one element per page (index 0 = first page):
+     * <pre>
+     * [
+     *   {
+     *     "page": 0,
+     *     "width":  &lt;page width in provider units&gt;,
+     *     "height": &lt;page height in provider units&gt;,
+     *     "blocks": [
+     *       {"type": "text", "content": "...", "x0": .., "y0": .., "x1": .., "y1": ..},
+     *       ...
+     *     ]
+     *   },
+     *   ...
+     * ]
+     * </pre>
+     * Coordinate units are the same as {@code width}/{@code height} — callers normalise
+     * by dividing by those values, so the absolute unit never matters.
+     */
+    default org.json.JSONArray ocrPdfBlocks(String model, byte[] pdfBytes) throws IOException {
+        throw new UnsupportedOperationException("PDF OCR not supported by this provider");
+    }
+
+    /**
+     * Whole-document OCR with an explicit document language hint.
+     * Providers that support language-aware OCR (e.g. Azure CV Read API) pass the
+     * BCP-47 language code (e.g. {@code "tr"}, {@code "en"}) to the OCR engine so
+     * that language-specific character sets (Turkish İ/ı, German ü/ö/ä …) are
+     * recognised more accurately.
+     *
+     * <p>Default implementation ignores the language and delegates to
+     * {@link #ocrPdfBlocks(String, byte[])} so existing providers need no changes.
+     *
+     * @param model    provider model identifier (may be ignored by some providers)
+     * @param pdfBytes raw PDF bytes
+     * @param language BCP-47 language code, e.g. {@code "tr"} or {@code "en"};
+     *                 {@code null} or empty means "auto-detect"
+     */
+    default org.json.JSONArray ocrPdfBlocks(String model, byte[] pdfBytes, String language) throws IOException {
+        return ocrPdfBlocks(model, pdfBytes);   // default: ignore language hint
+    }
 }

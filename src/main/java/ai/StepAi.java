@@ -149,6 +149,58 @@ public final class StepAi {
         throw new IOException("All block-OCR targets failed for step " + step + ": " + (last == null ? "" : last.getMessage()), last);
     }
 
+    /**
+     * Whether any configured target supports whole-document PDF OCR.
+     * When true, {@link #ocrPdfBlocks} should be preferred over per-page {@link #ocrBlocks} calls.
+     */
+    public boolean supportsPdfOcr() {
+        for (Target t : targets) {
+            if (t.client.supportsPdfOcr()) return true;
+        }
+        return false;
+    }
+
+    /**
+     * Whole-document PDF OCR: submits the raw PDF bytes once and returns per-page block data.
+     * See {@link AiClient#ocrPdfBlocks} for the output contract.
+     */
+    public org.json.JSONArray ocrPdfBlocks(byte[] pdfBytes) throws IOException {
+        return ocrPdfBlocks(pdfBytes, null);
+    }
+
+    /**
+     * Whole-document PDF OCR with a language hint.
+     * Providers that support language-aware OCR (e.g. Azure CV) use the BCP-47 code
+     * to improve recognition of language-specific characters (Turkish İ/ı/Ş/Ğ etc.).
+     *
+     * @param language BCP-47 language code (e.g. {@code "tr"}, {@code "en"});
+     *                 {@code null} means auto-detect
+     */
+    public org.json.JSONArray ocrPdfBlocks(byte[] pdfBytes, String language) throws IOException {
+        IOException last = null;
+        for (Target t : targets) {
+            try {
+                if (!t.client.supportsPdfOcr()) {
+                    throw new IOException("Provider " + t.provider + " does not support PDF OCR");
+                }
+                long t0 = System.currentTimeMillis();
+                org.json.JSONArray response = t.client.ocrPdfBlocks(t.model, pdfBytes, language);
+                long durationMs = System.currentTimeMillis() - t0;
+                usageStats.record(step + ".ocrPdfBlocks", t.provider, t.model,
+                        "pdf-bytes[" + pdfBytes.length + "]" + (language != null ? " lang=" + language : ""),
+                        response == null ? "" : response.toString(),
+                        durationMs);
+                return response;
+            } catch (IOException e) {
+                last = e;
+                String warnMsg = String.format("PDF-OCR step %s failed on %s/%s: %s", step, t.provider, t.model, e.getMessage());
+                log.warn(warnMsg);
+                plog("WARN", warnMsg);
+            }
+        }
+        throw new IOException("All PDF-OCR targets failed for step " + step + ": " + (last == null ? "" : last.getMessage()), last);
+    }
+
     // ── pipeline log helper ───────────────────────────────────────────────────
 
     private static void plog(String level, String msg) {

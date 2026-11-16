@@ -192,6 +192,20 @@ public final class PdfDoc implements AutoCloseable {
     }
 
     /**
+     * Returns the extracted text for the first {@code maxPages} pages (0-based).
+     * If {@code maxPages <= 0} or exceeds the actual page count, all pages are returned.
+     */
+    public List<String> pageTexts(int maxPages) throws IOException {
+        int limit = (maxPages > 0 && maxPages < doc.getNumberOfPages())
+                ? maxPages : doc.getNumberOfPages();
+        List<String> out = new ArrayList<>(limit);
+        for (int p = 0; p < limit; p++) {
+            out.add(text(p));
+        }
+        return out;
+    }
+
+    /**
      * Returns one {@link LineBbox} per visual line for the given page (0-based).
      *
      * Each entry carries the line's text and its bounding box normalised to 0–1000

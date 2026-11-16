@@ -1,11 +1,11 @@
 package junit
 
+import analyzer.Sample01
 import de.ser.doxis4.agentserver.AgentExecutionResult
 import org.junit.*
-import analyzer.Sample01
 import process.OriginalSignedAnalyze
 
-class TEST_Sample01 {
+class TEST_OriginalSignedAnalyze {
 
     Binding binding
 
@@ -21,9 +21,9 @@ class TEST_Sample01 {
 
     @Test
     void testForAgentResult() {
-        def agent = new Sample01();
+        def agent = new OriginalSignedAnalyze();
 
-        binding["AGENT_EVENT_OBJECT_CLIENT_ID"] = "ST0cBPM_CONTRACT24bdf4e5c0-a58f-48ad-ad40-2731da821b29182026-09-30T14:41:51.784Z010"
+        binding["AGENT_EVENT_OBJECT_CLIENT_ID"] = "ST07BPM_CLM24ae751aeb-9ec8-40ea-bb99-e558bbffb626182026-11-16T09:24:10.216Z0214"
 
         def result = (AgentExecutionResult) agent.execute(binding.variables)
         assert result.resultCode == 0

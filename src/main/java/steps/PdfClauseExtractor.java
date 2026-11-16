@@ -15,6 +15,7 @@ import org.json.JSONObject;
 import java.awt.image.BufferedImage;
 import java.io.File;
 import java.io.IOException;
+import java.nio.file.Files;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -62,15 +63,17 @@ public final class PdfClauseExtractor {
      * <p>Definition-list items (e.g. "(a) Amerika Birleşik Devletleri;") are typically
      * very short (< 50 chars after the token). Real sub-clauses carry a full sentence.
      * Matching threshold in {@link extraction.ClauseTree} is identical.
+     * Overridable via config key {@code pipeline.pdfMinParenTailChars} (default 100).
      */
-    private static final int MIN_PAREN_TAIL_CHARS = 50;
+    private static final int MIN_PAREN_TAIL_CHARS = 100;
 
     /**
      * Maximum number of parenthesized sub-clauses accepted under one parent clause.
      * Beyond this limit the items are treated as body text (overflow guard).
      * Matching threshold in {@link extraction.ClauseTree} is identical.
+     * Overridable via config key {@code pipeline.pdfMaxParenPerParent} (default 6).
      */
-    private static final int MAX_PAREN_PER_PARENT = 12;
+    private static final int MAX_PAREN_PER_PARENT = 6;
 
     private final AppConfig cfg;
     private final Router router;
@@ -132,9 +135,23 @@ public final class PdfClauseExtractor {
     }
 
     public JSONObject extractWithOcrPages(File pdf, String lang, List<JSONObject> ocrPagesOut) throws Exception {
+        return extractWithOcrPages(pdf, lang, ocrPagesOut, 0, null);
+    }
+
+    /**
+     * Full extraction with page-limit support.
+     *
+     * @param maxContentPages  process only the first N pages for clause extraction (0 = no limit).
+     *                         Pages beyond this limit are rendered and stored in {@code extraPagesOut}
+     *                         for the report (signature pages, annexes, etc.).
+     * @param extraPagesOut    if non-null, rendered images of pages beyond {@code maxContentPages}
+     *                         are appended here (one BufferedImage per extra page, in order).
+     */
+    public JSONObject extractWithOcrPages(File pdf, String lang, List<JSONObject> ocrPagesOut,
+                                          int maxContentPages, List<BufferedImage> extraPagesOut) throws Exception {
         List<BufferedImage> pages = new ArrayList<>();
         List<Block> blocks = new ArrayList<>();
-        boolean readable = readBlocks(pdf, lang, pages, blocks, ocrPagesOut);
+        boolean readable = readBlocks(pdf, lang, pages, blocks, ocrPagesOut, maxContentPages, extraPagesOut);
 
         if (blocks.isEmpty()) {
             log.warn("Signed PDF: no usable blocks found for language {}", lang);
@@ -184,8 +201,34 @@ public final class PdfClauseExtractor {
      */
     private boolean readBlocks(File pdf, String lang, List<BufferedImage> pagesOut, List<Block> blocksOut,
                                 List<JSONObject> ocrPagesOut) throws Exception {
+        return readBlocks(pdf, lang, pagesOut, blocksOut, ocrPagesOut, 0, null);
+    }
+
+    /**
+     * @param maxContentPages  process only the first N pages for clause extraction (0 = no limit).
+     *                         Pages beyond this limit are rendered and appended to {@code extraPagesOut}.
+     * @param extraPagesOut    if non-null, rendered images of pages beyond {@code maxContentPages}
+     *                         are appended here.
+     * @return true when the PDF was readable (native text used), false when OCR was run
+     */
+    private boolean readBlocks(File pdf, String lang, List<BufferedImage> pagesOut, List<Block> blocksOut,
+                                List<JSONObject> ocrPagesOut, int maxContentPages,
+                                List<BufferedImage> extraPagesOut) throws Exception {
         try (PdfDoc doc = PdfDoc.open(pdf)) {
-            List<String> pageTexts = doc.pageTexts();
+            // Determine how many pages to process for clause extraction
+            int totalPages = doc.pageCount();
+            // contentPages: pages to include in clause extraction
+            // extraPages: remaining pages (signature, annex) → rendered for report only
+            int contentPages = (maxContentPages > 0 && maxContentPages < totalPages)
+                    ? maxContentPages : totalPages;
+            int numExtra = totalPages - contentPages;
+
+            if (maxContentPages > 0 && numExtra > 0) {
+                log.info("Signed PDF [{}]: page limit {} — processing {} content page(s), {} extra page(s) skipped for OCR",
+                        lang, maxContentPages, contentPages, numExtra);
+            }
+
+            List<String> pageTexts = doc.pageTexts(contentPages);
 
             if (isReadablePdf(pageTexts)) {
                 // ── NATIVE TEXT MODE ──────────────────────────────────────────
@@ -195,6 +238,7 @@ public final class PdfClauseExtractor {
                         lang, pageTexts.size());
 
                 float dpi = cfg.pipelineInt("renderDpi", 150);
+                log.info("Signed PDF [{}]: native render DPI={}", lang, (int) dpi);
                 double headerEdge = cfg.pipelineDouble("pdfNativeHeaderMarginPct", 5.0) * 10.0;
                 double footerEdge = 1000.0 - cfg.pipelineDouble("pdfNativeFooterMarginPct", 6.0) * 10.0;
 
@@ -210,7 +254,7 @@ public final class PdfClauseExtractor {
 
                 // Collect all lines first so we can auto-detect the column boundary
                 List<List<PdfDoc.LineBbox>> allLines = new ArrayList<>();
-                for (int p = 0; p < doc.pageCount(); p++) {
+                for (int p = 0; p < contentPages; p++) {
                     pagesOut.add(doc.render(p, dpi));
                     allLines.add(doc.pageLineBboxes(p));
                 }
@@ -247,22 +291,38 @@ public final class PdfClauseExtractor {
                                 lb.x0, lb.y0, lb.x1, lb.y1, colIdx));
                     }
                     log.debug("Signed PDF [{}] page {}/{}: {} native lines ({} header/footer skipped)",
-                            lang, p + 1, doc.pageCount(), lines.size() - skipped, skipped);
+                            lang, p + 1, contentPages, lines.size() - skipped, skipped);
                 }
                 // ocrPagesOut intentionally left empty — SignatureDetector falls back to tail heuristic
+                // Render extra pages (signature/annex) for the report
+                renderExtraPages(doc, contentPages, totalPages, dpi, extraPagesOut);
                 return true;  // readable
             }
 
             // ── OCR MODE ─────────────────────────────────────────────────────
             // The PDF is a scan (image-only pages): render + OCR each page.
-            log.info("Signed PDF [{}]: OCR mode — no native text detected, rendering {} page(s)",
-                    lang, doc.pageCount());
+            log.info("Signed PDF [{}]: OCR mode — no native text detected, rendering {} content page(s) of {}",
+                    lang, contentPages, totalPages);
             StepAi ocrAi = router.get("pdfPageBlockOcr");
+
+            // ── Azure CV: whole-document PDF path ──────────────────────────
+            if (ocrAi.supportsPdfOcr()) {
+                return readBlocksViaPdfOcr(pdf, doc, ocrAi, lang, pagesOut, blocksOut, ocrPagesOut,
+                        contentPages, extraPagesOut);
+            }
+
+            // ── Per-page OCR path (Mistral OCR, etc.) ─────────────────────
             // ocrRenderDpi: OCR için ayrı DPI (default 300 — native crop'tan bağımsız)
-            float dpi = cfg.pipelineInt("ocrRenderDpi", cfg.pipelineInt("renderDpi", 150));
+            int ocrRenderDpiCfg = cfg.pipelineInt("ocrRenderDpi", -1);
+            int renderDpiCfg    = cfg.pipelineInt("renderDpi", 150);
+            float dpi = ocrRenderDpiCfg > 0 ? ocrRenderDpiCfg : renderDpiCfg;
+            log.info("Signed PDF [{}]: OCR render DPI={} (ocrRenderDpi={}, renderDpi={})",
+                    lang, (int) dpi,
+                    ocrRenderDpiCfg > 0 ? ocrRenderDpiCfg : "not-set",
+                    renderDpiCfg);
             int id = 0;
             int pagesFailed = 0;
-            for (int p = 0; p < doc.pageCount(); p++) {
+            for (int p = 0; p < contentPages; p++) {
                 BufferedImage page = doc.render(p, dpi);
                 pagesOut.add(page);
 
@@ -306,14 +366,142 @@ public final class PdfClauseExtractor {
                         kept++;
                     }
                 }
-                log.info("Signed PDF [{}] page {}/{}: {} OCR blocks kept", lang, p + 1, doc.pageCount(), kept);
+                log.info("Signed PDF [{}] page {}/{}: {} OCR blocks kept", lang, p + 1, contentPages, kept);
             }
             if (pagesFailed > 0) {
-                log.warn("Signed PDF [{}]: {} of {} page(s) failed OCR — extraction may be incomplete",
-                        lang, pagesFailed, doc.pageCount());
+                log.warn("Signed PDF [{}]: {} of {} content page(s) failed OCR — extraction may be incomplete",
+                        lang, pagesFailed, contentPages);
             }
+            // Render extra pages (signature/annex) for the report
+            renderExtraPages(doc, contentPages, totalPages, cfg.pipelineInt("renderDpi", 150), extraPagesOut);
             return false;  // OCR
         }
+    }
+
+    /**
+     * Whole-document PDF OCR path using a provider that supports {@link ai.AiClient#ocrPdfBlocks}
+     * (e.g. Azure Computer Vision Read API).
+     *
+     * <p>The PDF bytes are sent to the provider in one request; the response already contains
+     * per-page block data with real bounding boxes and text.  No local rendering is needed for
+     * OCR — pages are still rendered locally at {@code renderDpi} but only for the crop images
+     * that appear in the final report (same use as the per-page path).</p>
+     */
+    private boolean readBlocksViaPdfOcr(File pdf, PdfDoc doc, StepAi ocrAi,
+                                         String lang,
+                                         List<BufferedImage> pagesOut,
+                                         List<Block> blocksOut,
+                                         List<JSONObject> ocrPagesOut,
+                                         int maxContentPages,
+                                         List<BufferedImage> extraPagesOut) throws Exception {
+        int totalPages   = doc.pageCount();
+        // contentPages: pages whose blocks go into clause extraction
+        int contentPages = (maxContentPages > 0 && maxContentPages < totalPages)
+                ? maxContentPages : totalPages;
+        int numExtra = totalPages - contentPages;
+
+        log.info("Signed PDF [{}]: Azure CV PDF-OCR mode — submitting full PDF ({} pages); clause extraction limited to first {} page(s), {} extra page(s)",
+                lang, totalPages, contentPages, numExtra);
+
+        // Render pages for crop images (report only — not sent to OCR)
+        float dpi = cfg.pipelineInt("renderDpi", 150);
+        for (int p = 0; p < totalPages; p++) {
+            pagesOut.add(doc.render(p, dpi));
+        }
+
+        // Read raw PDF bytes and send to Azure
+        byte[] pdfBytes = Files.readAllBytes(pdf.toPath());
+        JSONArray pageResults;
+        try {
+            // Pass the document language to Azure CV so it can optimise for language-specific
+            // character sets (Turkish İ/ı/Ş/Ğ/Ç/Ö/Ü, German ü/ö/ä …).
+            // Azure accepts BCP-47 codes ("tr", "en", "de", "fr", "ar" …); null = auto-detect.
+            String ocrLang = toLowerBcp47(lang);
+            pageResults = ocrAi.ocrPdfBlocks(pdfBytes, ocrLang);
+        } catch (IOException e) {
+            throw new IOException(
+                    "Signed PDF [" + lang + "]: Azure CV PDF-OCR failed — " + e.getMessage(), e);
+        }
+
+        // Build ocrPagesOut cache (same contract used by SignatureDetector + guided pass)
+        // and populate blocksOut — but only for content pages (pageIndex < contentPages).
+        // Extra pages (signature/annex) are excluded from clause extraction just like in
+        // the per-page Mistral path; their rendered images were already added to pagesOut above.
+        int id = 0;
+        for (int pi = 0; pi < pageResults.length(); pi++) {
+            JSONObject pageData = pageResults.optJSONObject(pi);
+            if (pageData == null) continue;
+
+            double pw = pageData.optDouble("width",  1000);
+            double ph = pageData.optDouble("height", 1000);
+            if (pw <= 0) pw = 1000;
+            if (ph <= 0) ph = 1000;
+
+            int pageIndex = pageData.optInt("page", pi);  // 0-based
+
+            // Build the per-page cache entry in the same shape as the per-page Mistral path
+            // so SignatureDetector and the guided pass can consume it without changes.
+            // ocrPagesOut receives ALL pages (signature detector needs the full set).
+            JSONObject cacheEntry = new JSONObject()
+                    .put("width",  pw)
+                    .put("height", ph)
+                    .put("blocks", pageData.optJSONArray("blocks"));
+            if (ocrPagesOut != null) {
+                // Ensure the list is long enough to hold this page index
+                while (ocrPagesOut.size() <= pageIndex) {
+                    ocrPagesOut.add(new JSONObject().put("width", pw).put("height", ph)
+                            .put("blocks", new JSONArray()));
+                }
+                ocrPagesOut.set(pageIndex, cacheEntry);
+            }
+
+            // Skip extra pages for clause-extraction block list
+            if (pageIndex >= contentPages) {
+                log.debug("Signed PDF [{}] page {}/{}: extra page (beyond content limit {}), blocks excluded from extraction",
+                        lang, pageIndex + 1, totalPages, contentPages);
+                continue;
+            }
+
+            JSONArray arr = pageData.optJSONArray("blocks");
+            int kept = 0;
+            if (arr != null) {
+                for (int i = 0; i < arr.length(); i++) {
+                    JSONObject b = arr.optJSONObject(i);
+                    if (b == null) continue;
+                    String type = b.optString("type", "text").toLowerCase();
+                    if (SKIP_TYPES.contains(type)) continue;
+                    String text = b.optString("content", "").trim();
+                    if (text.isEmpty() && !"table".equals(type)) continue;
+                    double x0 = b.optDouble("x0", 0) / pw * 1000.0;
+                    double y0 = b.optDouble("y0", 0) / ph * 1000.0;
+                    double x1 = b.optDouble("x1", pw) / pw * 1000.0;
+                    double y1 = b.optDouble("y1", ph) / ph * 1000.0;
+                    blocksOut.add(new Block(id++, pageIndex, type, text, x0, y0, x1, y1));
+                    kept++;
+                }
+            }
+            log.info("Signed PDF [{}] page {}/{}: {} Azure CV blocks kept",
+                    lang, pageIndex + 1, totalPages, kept);
+        }
+        // Extra pages for report (consistent with Mistral path's renderExtraPages call)
+        if (extraPagesOut != null && numExtra > 0) {
+            for (int p = contentPages; p < totalPages; p++) {
+                extraPagesOut.add(pagesOut.get(p));
+            }
+            log.info("Signed PDF [{}]: {} extra page image(s) forwarded for report", lang, numExtra);
+        }
+
+        log.info("Signed PDF [{}]: Azure CV PDF-OCR complete — {} clause-extraction blocks from {} content page(s) (skipped {} extra page(s))",
+                lang, blocksOut.size(), contentPages, numExtra);
+
+        // Warn if Azure returned fewer pages than the PDF — silent data loss otherwise
+        if (pageResults.length() < doc.pageCount()) {
+            log.warn("Signed PDF [{}]: Azure returned {} page(s) but PDF has {} — {} page(s) missing, " +
+                    "extraction may be incomplete",
+                    lang, pageResults.length(), doc.pageCount(),
+                    doc.pageCount() - pageResults.length());
+        }
+        return false; // OCR mode
     }
 
     /**
@@ -607,6 +795,13 @@ public final class PdfClauseExtractor {
      */
     private JSONObject segmentNative(List<Block> blocks, List<BufferedImage> pages, String lang) throws IOException {
         java.util.regex.Pattern headingPat = buildClauseHeadingPattern();
+        // Config overrides for parenthesized sub-clause guards
+        boolean parenEnabled   = cfg.pipelineBoolean("pdfParenSubclauses", false);
+        int minParenTail       = cfg.pipelineInt("pdfMinParenTailChars", MIN_PAREN_TAIL_CHARS);
+        int maxParenPerParent  = cfg.pipelineInt("pdfMaxParenPerParent", MAX_PAREN_PER_PARENT);
+        if (!parenEnabled) {
+            log.info("Signed PDF [{}]: parenthesized sub-clause synthesis disabled (pdfParenSubclauses=false)", lang);
+        }
 
         Map<String, TreeSet<Integer>> found = new LinkedHashMap<>();
         // headingTexts: for heading blocks that also carry a title after the number,
@@ -643,18 +838,46 @@ public final class PdfClauseExtractor {
                 if (rawNo != null) {
                     // ---- Non-parenthesized heading (groups 1-3) ----
                     String no = ClauseNumber.normalize(rawNo);
-                    if (no != null && ClauseNumber.isValidNextClause(currentClause, no)) {
-                        currentClause = no;
-                        currentParent = no;
-                        parenthesizedCounter = 0;
-                        found.computeIfAbsent(no, k -> new TreeSet<>());
-                        String afterNo = trimmed.substring(m.end()).trim();
-                        if (!afterNo.isEmpty()) {
-                            headingTexts.put(b.id, afterNo);
-                            found.get(currentClause).add(b.id);
+                    if (no != null) {
+                        // İsLegalReference kontrolü — yasal atıfları madde sanma
+                        if (extraction.ClauseNumbering.isLegalReference(trimmed)) {
+                            if (currentClause != null) found.get(currentClause).add(b.id);
+                            continue;
                         }
-                        // Bare number line ("4." alone) — open clause, no content block added.
-                        continue;
+                        extraction.ClauseNumbering.Relation rel =
+                                extraction.ClauseNumbering.classify(currentClause, no);
+                        if (rel == extraction.ClauseNumbering.Relation.VALID
+                                || rel == extraction.ClauseNumbering.Relation.DUPLICATE) {
+                            currentClause = no;
+                            currentParent = no;
+                            parenthesizedCounter = 0;
+                            found.computeIfAbsent(no, k -> new TreeSet<>());
+                            String afterNo = trimmed.substring(m.end()).trim();
+                            if (!afterNo.isEmpty()) {
+                                headingTexts.put(b.id, afterNo);
+                                found.get(currentClause).add(b.id);
+                            }
+                            continue;
+                        } else if (rel == extraction.ClauseNumbering.Relation.RESET
+                                || rel == extraction.ClauseNumbering.Relation.BACKWARD) {
+                            // EK / Schedule bölümü: yeni bölüm başlıyor (1'e geri dönüş).
+                            // Bu bölümdeki maddeler S#-prefixed key olarak eklenir;
+                            // AnalyzeMerger bunları son normal maddeye absorbe eder.
+                            // Bu şekilde ek bölümlerindeki değişiklikler raporlanır.
+                            currentClause = no;
+                            currentParent = no;
+                            parenthesizedCounter = 0;
+                            found.computeIfAbsent(no, k -> new TreeSet<>());
+                            String afterNo = trimmed.substring(m.end()).trim();
+                            if (!afterNo.isEmpty()) {
+                                headingTexts.put(b.id, afterNo);
+                                found.get(currentClause).add(b.id);
+                            }
+                            log.debug("Signed PDF [{}] segmentNative: {} ({}) — EK/schedule segment started at block {}",
+                                    lang, no, rel, b.id);
+                            continue;
+                        }
+                        // INVALID — body block
                     }
                 } else {
                     // ---- Parenthesized heading (groups 5-7): synthesize sub-clause ----
@@ -667,11 +890,11 @@ public final class PdfClauseExtractor {
                     // Guard: short tail → definition-list item, not a real sub-clause.
                     // e.g. "(a) Amerika Birleşik Devletleri;" has a tail of ~32 chars.
                     // Real sub-clauses (e.g. "(a) ALICI, SATICI'dan Ekipman...") are 50+ chars.
-                    // Guard: overflow → more than 12 parenthesized items under one parent.
-                    if (currentParent != null) {
+                    // Guard: overflow → more than maxParenPerParent items under one parent.
+                    if (parenEnabled && currentParent != null) {
                         String afterToken = trimmed.substring(m.end()).trim();
-                        boolean shortTail     = afterToken.length() < MIN_PAREN_TAIL_CHARS;
-                        boolean counterOverflow = parenthesizedCounter >= MAX_PAREN_PER_PARENT;
+                        boolean shortTail       = afterToken.length() < minParenTail;
+                        boolean counterOverflow = parenthesizedCounter >= maxParenPerParent;
                         if (!shortTail && !counterOverflow) {
                             parenthesizedCounter++;
                             String no = currentParent + "." + parenthesizedCounter;
@@ -748,6 +971,10 @@ public final class PdfClauseExtractor {
     private JSONObject segmentAndCrop(List<Block> blocks, List<BufferedImage> pages, String lang) throws IOException {
         StepAi segAi = router.get("clauseSegmentationPDFSignedDocument");
         int chunkChars = cfg.pipelineInt("pdfChunkChars", cfg.pipelineInt("docxChunkChars", 24000));
+        boolean parenEnabled = cfg.pipelineBoolean("pdfParenSubclauses", false);
+        if (!parenEnabled) {
+            log.info("Signed PDF [{}] segmentation: parenthesized sub-clause synthesis disabled (pdfParenSubclauses=false)", lang);
+        }
 
         Map<String, TreeSet<Integer>> found = new LinkedHashMap<>();
         String title = "";
@@ -759,7 +986,7 @@ public final class PdfClauseExtractor {
             chunksTotal++;
             String resp;
             try {
-                resp = segAi.chat(SYSTEM, prompt(lang, chunk, prev), List.of());
+                resp = segAi.chat(SYSTEM, prompt(lang, chunk, prev, parenEnabled), List.of());
             } catch (IOException e) {
                 // A single chunk failure (e.g. content_filter, length, transient error) must not
                 // abort the whole document — log and continue with the next chunk so that the
@@ -787,6 +1014,39 @@ public final class PdfClauseExtractor {
                 String no = ClauseNumber.normalize(c.optString("number", ""));
                 if (no == null) {
                     continue;
+                }
+                // pdfParenSubclauses=false → LLM'den gelen parantez-sentezi numaraları reddet.
+                // Parantez sentezi: LLM "(a)/(b)" öğelerini parent.1/parent.2 olarak döndürür.
+                // Filtre yalnızca sentezlenmiş numaralara uygulanır — OCR metninde açıkça
+                // "9.1.1." yazan gerçek madde numaraları reddedilmez.
+                // Sentez testi: bu chunk'taki block'lardan hiçbiri "no" ile başlamıyorsa sentez.
+                if (!parenEnabled && no.contains(".")) {
+                    long depth = no.chars().filter(ch -> ch == '.').count() + 1;
+                    long prevDepth = prev.isEmpty() ? 0 : prev.chars().filter(ch -> ch == '.').count() + 1;
+                    if (depth == prevDepth + 1 && prevDepth >= 2) {
+                        // Explicit metin kontrolü: OCR bloklarından biri bu numarayla başlıyor mu?
+                        boolean hasExplicitText = false;
+                        List<Integer> candidateIds = DocxClauseExtractor.parseIds(c.opt("blocks"), blocks.size());
+                        for (int bid : candidateIds) {
+                            if (bid >= 0 && bid < blocks.size()) {
+                                String bt = extraction.ClauseNumbering.stripMarkdownPrefix(
+                                        blocks.get(bid).text.trim());
+                                extraction.ClauseNumbering.ParseResult bpr =
+                                        extraction.ClauseNumbering.parse(bt);
+                                if (bpr != null && bpr.normalized.equals(no)) {
+                                    hasExplicitText = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if (!hasExplicitText) {
+                            log.debug("Signed PDF [{}] clause {} skipped — pdfParenSubclauses=false, synthesized (no explicit text in OCR), depth={} after prev='{}'",
+                                    lang, no, depth, prev);
+                            continue;
+                        }
+                        log.debug("Signed PDF [{}] clause {} kept — pdfParenSubclauses=false but explicit OCR text found, depth={} after prev='{}'",
+                                lang, no, depth, prev);
+                    }
                 }
                 // Sadece INVALID reddedilir — VALID, DUPLICATE, RESET, BACKWARD kabul edilir.
                 // (DocxClauseExtractor ile aynı strateji: AI atıfları filtrelemeli,
@@ -971,6 +1231,28 @@ public final class PdfClauseExtractor {
     }
 
     /**
+     * Renders pages from {@code startPage} (inclusive) to {@code endPage} (exclusive)
+     * and appends them to {@code extraPagesOut}.
+     * Called after clause extraction to collect signature/annex pages for the report.
+     */
+    private static void renderExtraPages(PdfDoc doc, int startPage, int endPage,
+                                          float dpi, List<BufferedImage> extraPagesOut) {
+        if (extraPagesOut == null || startPage >= endPage) return;
+        for (int p = startPage; p < endPage; p++) {
+            try {
+                extraPagesOut.add(doc.render(p, dpi));
+                log.debug("Rendered extra page {}/{} for report", p + 1, endPage);
+            } catch (IOException e) {
+                log.warn("Could not render extra page {}: {}", p + 1, e.getMessage());
+            }
+        }
+        if (endPage > startPage) {
+            log.info("Rendered {} extra page(s) (pages {}-{}) for report",
+                    endPage - startPage, startPage + 1, endPage);
+        }
+    }
+
+    /**
      * Releases all page BufferedImages held in the list so the GC can reclaim
      * the memory immediately after all clause crops have been produced.
      * The list entries are nulled rather than the list being cleared so that
@@ -981,6 +1263,77 @@ public final class PdfClauseExtractor {
         for (int i = 0; i < pages.size(); i++) {
             pages.set(i, null);
         }
+    }
+
+    /**
+     * Produces one cropped image per clause in a memory-efficient way.
+     *
+     * <p>Instead of holding all rendered page images alive until the full assembly
+     * loop is done, this method processes pages in ascending order and nulls each
+     * page entry immediately after all crops that touch that page have been
+     * produced. For a 50-page PDF at 300 DPI this can reduce peak heap usage by
+     * hundreds of megabytes.</p>
+     *
+     * @param clauseBlocks map from clause number to the blocks belonging to that clause
+     * @param pages        rendered page images (entries are nulled in-place as they are consumed)
+     * @param pad          crop padding in pixels
+     * @return map from clause number to the stacked-crop image (null values omitted)
+     */
+    private static Map<String, BufferedImage> cropAllClauses(
+            Map<String, List<Block>> clauseBlocks,
+            List<BufferedImage> pages,
+            int pad) {
+
+        // Build an index: pageIndex → set of clause numbers that touch that page
+        Map<Integer, Set<String>> pageToClauseNos = new TreeMap<>();
+        for (Map.Entry<String, List<Block>> e : clauseBlocks.entrySet()) {
+            for (Block b : e.getValue()) {
+                pageToClauseNos.computeIfAbsent(b.page, k -> new LinkedHashSet<>()).add(e.getKey());
+            }
+        }
+
+        // For each clause, accumulate per-page crop parts in page order
+        Map<String, List<BufferedImage>> parts = new LinkedHashMap<>();
+
+        // Process pages in ascending order; null each page after all its crops are done
+        for (Map.Entry<Integer, Set<String>> pe : pageToClauseNos.entrySet()) {
+            int pageIdx = pe.getKey();
+            if (pageIdx < 0 || pageIdx >= pages.size()) continue;
+            BufferedImage page = pages.get(pageIdx);
+            if (page == null) continue;
+
+            for (String no : pe.getValue()) {
+                List<Block> cblocks = clauseBlocks.get(no);
+                if (cblocks == null) continue;
+                // Compute the bounding box of blocks on this specific page
+                double bx0 = 1000, by0 = 1000, bx1 = 0, by1 = 0;
+                boolean any = false;
+                for (Block b : cblocks) {
+                    if (b.page != pageIdx) continue;
+                    bx0 = Math.min(bx0, b.x0); by0 = Math.min(by0, b.y0);
+                    bx1 = Math.max(bx1, b.x1); by1 = Math.max(by1, b.y1);
+                    any = true;
+                }
+                if (!any) continue;
+                BufferedImage crop = Images.crop(page, bx0, by0, bx1, by1, pad);
+                if (crop != null) {
+                    parts.computeIfAbsent(no, k -> new ArrayList<>()).add(crop);
+                }
+            }
+
+            // Release this page's memory immediately — all crops that needed it are done
+            pages.set(pageIdx, null);
+        }
+
+        // Stack per-clause parts into one image
+        Map<String, BufferedImage> result = new LinkedHashMap<>();
+        for (Map.Entry<String, List<BufferedImage>> e : parts.entrySet()) {
+            BufferedImage stacked = Images.stackVertically(e.getValue());
+            if (stacked != null) {
+                result.put(e.getKey(), stacked);
+            }
+        }
+        return result;
     }
 
     private static JSONArray bboxes(List<Block> blocks) {
@@ -1023,7 +1376,7 @@ public final class PdfClauseExtractor {
         return "[" + b.id + "|p" + (b.page + 1) + "|" + b.type + "] " + Json.abbreviate(b.text, 1200) + "\n";
     }
 
-    private static String prompt(String lang, List<Block> chunk, String prev) {
+    private static String prompt(String lang, List<Block> chunk, String prev, boolean parenEnabled) {
         StringBuilder sb = new StringBuilder();
         sb.append("TARGET LANGUAGE: ").append(lang).append(". The document may contain several languages; ignore ")
                 .append("blocks that are not written in the target language.\n")
@@ -1031,12 +1384,23 @@ public final class PdfClauseExtractor {
                 .append("blocks are already markdown.\n\n")
                 .append("Segment the blocks into numbered clauses and sub-clauses (e.g. 1, 1.1, 1.2, 2.3.4).\n")
                 .append("IMPORTANT: Every sub-clause (e.g. \"1.1\", \"1.2\") MUST be returned as a SEPARATE entry ")
-                .append("with its own \"number\" and \"blocks\". Do NOT merge sub-clauses into their parent clause.\n")
-                .append("PARENTHESIZED ITEMS: \"(a)\", \"(b)\", \"(1)\", \"(2)\" etc. are sub-clauses ONLY when substantive ")
-                .append("(full obligation/condition, typically 50+ characters). Short definition-list items like ")
-                .append("\"(a) United States;\", \"(b) United Kingdom;\", \"(a) Amerika Birleşik Devletleri;\" ")
-                .append("are NOT sub-clauses — assign them to the parent clause body, NOT as separate numbered entries.\n")
-                .append("For each clause return:\n")
+                .append("with its own \"number\" and \"blocks\". Do NOT merge sub-clauses into their parent clause.\n");
+        if (parenEnabled) {
+            sb.append("PARENTHESIZED ITEMS: \"(a)\", \"(b)\", \"(1)\", \"(2)\" etc. are sub-clauses ONLY when ALL of the following are true:\n")
+              .append("  1. The item contains a full independent obligation, condition, or right (not a name, country, or short phrase).\n")
+              .append("  2. The text after the marker is 100+ characters long.\n")
+              .append("  3. The parent clause has 6 or fewer such items (long definition lists are NOT sub-clauses).\n")
+              .append("  4. The document structure clearly treats them as numbered sub-clauses (not as bullet points or enumerated lists).\n")
+              .append("When in doubt, do NOT treat parenthesized items as sub-clauses — assign them to the parent clause body.\n")
+              .append("Examples of items that are NOT sub-clauses:\n")
+              .append("  - \"(a) Amerika Birleşik Devletleri;\", \"(b) United Kingdom;\", \"(c) Germany;\" → country/name lists, body of parent.\n")
+              .append("  - Any series of 7+ items like (a)(b)(c)...(g) or (1)(2)(3)...(8) → enumeration list, body of parent.\n");
+        } else {
+            sb.append("PARENTHESIZED ITEMS: \"(a)\", \"(b)\", \"(1)\", \"(2)\", \"(i)\", \"(ii)\" etc. are NEVER sub-clauses in this document.\n")
+              .append("  Assign ALL parenthesized items to the body of their enclosing parent clause.\n")
+              .append("  Do NOT create numbered entries for (a), (b), (c), (1), (2) etc. — they are list items, not clause headings.\n");
+        }
+        sb.append("For each clause return:\n")
                 .append(" - number: digits and dots only, exactly as printed (e.g. \"1\", \"1.1\", \"1.2\", \"2.3.4\")\n")
                 .append(" - blocks: ids of ALL blocks that belong to that clause's OWN text, as a compact string of ")
                 .append("ids and ranges, e.g. \"12-14,17\" (include tables that belong to it).\n")
@@ -1048,10 +1412,26 @@ public final class PdfClauseExtractor {
                 .append("not to the parent. For example: if clause 1 has sub-clauses 1.1 and 1.2, and after 1.2's ")
                 .append("address block there are two more paragraphs (party definitions, notice rules), those ")
                 .append("paragraphs belong to 1.2 — NOT back to clause 1.\n")
+                .append("WHAT IS NOT A CLAUSE HEADING — CRITICAL:\n")
+                .append("  A block is a clause heading ONLY when ALL of these are true:\n")
+                .append("    1. The block is visually distinct (numbered heading, bold, or alone on its line).\n")
+                .append("    2. The number appears at the VERY START of the block (not mid-sentence, not after a comma).\n")
+                .append("    3. The number advances the document outline by exactly one logical step from the previous clause.\n")
+                .append("  A block is NOT a clause heading when:\n")
+                .append("  - A number appears inside running body text (e.g. '...Madde 8.2 uyarinca...', '...clause 5.3 of the agreement...').\n")
+                .append("  - The text is a continuation paragraph after a heading that was already captured.\n")
+                .append("  - The block is a list item, footnote, or definition entry.\n")
+                .append("  - The number would require jumping MORE than 3 levels from the current clause (likely a legal reference).\n")
                 .append("Example: if the document has clause 1 (intro), clause 1.1 and clause 1.2, return THREE separate ")
                 .append("entries: {\"number\":\"1\",...}, {\"number\":\"1.1\",...}, {\"number\":\"1.2\",...}.\n")
-                .append("Blocks that belong to no numbered clause (title, parties, preamble, signatures) are omitted; ")
+                .append("Blocks that belong to no numbered clause (document title/header, pre-contractual recitals before clause 1, signature blocks at the end) are omitted; ")
                 .append("return the document title in the target language in \"title\" if it is in this part, else \"\".\n")
+                .append("CRITICAL: Address lines, party names, company details, PO boxes, and registration numbers that appear ")
+                .append("AFTER a sub-clause heading (e.g. after \"1.1.\") are PART OF THAT SUB-CLAUSE — assign them to it. ")
+                .append("Do NOT treat them as 'parties/preamble' and omit them.\n")
+                .append("ANNEX/EXHIBIT LIST RULE: A block that lists document annexes/exhibits (e.g. \"EKLER:\", \"EK - 1 ...\", \"Annex 1 ...\", ")
+                .append("\"ATTACHMENTS:\") is NOT a new clause — assign it to the LAST numbered clause in this chunk. ")
+                .append("Do NOT invent a new clause number for it (e.g. do not assign it clause 19 if the last real clause was 18).\n")
                 .append("The previous chunk ended inside clause \"").append(prev).append("\": if the first blocks ")
                 .append("continue it, return that same number again.\n")
                 .append("IMPORTANT — clause numbering must continue logically from \"").append(prev).append("\":\n")
@@ -1201,6 +1581,11 @@ public final class PdfClauseExtractor {
         List<String> sortedExpected = new ArrayList<>(expectedNos);
         sortedExpected.sort(ClauseNumber.COMPARATOR);
 
+        // Config overrides for parenthesized sub-clause guards (same as segmentNative)
+        boolean parenEnabled  = cfg.pipelineBoolean("pdfParenSubclauses", false);
+        int minParenTail      = cfg.pipelineInt("pdfMinParenTailChars", MIN_PAREN_TAIL_CHARS);
+        int maxParenPerParent = cfg.pipelineInt("pdfMaxParenPerParent", MAX_PAREN_PER_PARENT);
+
         Map<String, TreeSet<Integer>> found = new LinkedHashMap<>();
         Map<Integer, String> headingTexts = new LinkedHashMap<>();
         String currentClause = null;
@@ -1260,10 +1645,10 @@ public final class PdfClauseExtractor {
                     // ---- Parenthesized heading (groups 5-7) ----
                     // Synthesize parent.N and check if it is in the expected set.
                     // Guard: short tail or counter overflow → definition-list item, skip.
-                    if (currentParent != null) {
+                    if (parenEnabled && currentParent != null) {
                         String afterToken = trimmed.substring(m.end()).trim();
-                        boolean shortTail       = afterToken.length() < MIN_PAREN_TAIL_CHARS;
-                        boolean counterOverflow = parenthesizedCounter >= MAX_PAREN_PER_PARENT;
+                        boolean shortTail       = afterToken.length() < minParenTail;
+                        boolean counterOverflow = parenthesizedCounter >= maxParenPerParent;
                         if (!shortTail && !counterOverflow) {
                             int tentativeCounter = parenthesizedCounter + 1;
                             String no = currentParent + "." + tentativeCounter;
@@ -1479,5 +1864,17 @@ public final class PdfClauseExtractor {
             sb.append(line(b));
         }
         return sb.toString();
+    }
+
+    /**
+     * Converts an internal language code (e.g. "TR", "EN") to a lowercase BCP-47 code
+     * suitable for language-aware OCR APIs (Azure CV Read, etc.).
+     * Returns {@code null} for unrecognised / empty input so the provider falls back to
+     * auto-detection.
+     */
+    private static String toLowerBcp47(String lang) {
+        if (lang == null || lang.isBlank()) return null;
+        // Internal codes are uppercase ISO-639-1; Azure and most OCR APIs want lowercase BCP-47.
+        return lang.trim().toLowerCase();
     }
 }

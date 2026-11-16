@@ -214,3 +214,11 @@ task addUnitConfig {
         println "addUnitConfig: clauseUnits written to ${cfgFile}"
     }
 }
+
+task pdfCheck(type: JavaExec) {
+    group = 'diagnostics'
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass = 'test.PdfNativeCheck'
+    args = ["c:/contract-analyze/sample-07/Signed_Document.pdf"]
+}
+

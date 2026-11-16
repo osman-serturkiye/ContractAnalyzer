@@ -3,6 +3,7 @@ package steps;
 import ai.Router;
 import common.GeneralLib;
 import config.AppConfig;
+import docx.DocxReader;
 import org.apache.logging.log4j.Level;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -201,7 +202,20 @@ public final class Pipeline {
                 List<String> kept = new ArrayList<>();
                 for (String lang : detected) {
                     if (debug) log.info("[DEBUG] {} [{}] clauseExtract başlıyor", key, lang);
-                    JSONObject extracted = cp.obj(key + "." + lang + ".extract",
+                    // Tracked changes kontrolü — ilk dilde bir kez yap
+                    if (detected.indexOf(lang) == 0) {
+                        if (DocxReader.hasTrackedChanges(docx)) {
+                            plog("WARN", "{}: '{}' dosyasında kabul edilmemiş tracked change var — " +
+                                    "fraud tespiti etkilenebilir. Lütfen 'Accept All Changes' uygulayın.",
+                                    key, docx.getName());
+                        }
+                    }
+                    // Checkpoint key'e dosya hash'i ekle — farklı dosya aynı outDir'e çalıştırıldığında
+                    // stale cache replay'ini engeller.
+                    String docxHash = Checkpoint.fileHash(docx);
+                    String cpKey    = key + "." + lang + ".extract"
+                            + (docxHash.isEmpty() ? "" : "." + docxHash);
+                    JSONObject extracted = cp.obj(cpKey,
                             () -> az.clauseExtractionDOCOriginalDocument(docx, lang));
                     JSONObject cl = extracted.optJSONObject("clauses");
                     if (cl == null || cl.length() < minClauses) {
@@ -239,9 +253,24 @@ public final class Pipeline {
         Future<DocAnalysis> signedFuture = null;
         // ocrPages: signed Future'ın içinde doldurulur; signature detection bu Future bittikten sonra çalışır.
         final List<JSONObject> ocrPages = new ArrayList<>();
+        // extraPages: signed PDF'in original sayfa sayısını aşan sayfaları (imza, ek) — rapor için render edilir
+        final List<java.awt.image.BufferedImage> extraPages = new ArrayList<>();
+        // Signed PDF page limit:
+        // Signed belgesine ek sayfa eklenmiş olabileceğinden (ekler, teknik tablo vb.)
+        // DOCX sayfa sayısına göre limit koymak güvenli değildir — aynı metin farklı
+        // layout ile daha fazla sayfaya yayılabilir, üstelik ek içerik de olabilir.
+        // Bu nedenle default'ta limit yoktur; imza/noter sayfaları SignatureDetector
+        // ve S# segment absorption ile zaten ayrıştırılmaktadır.
+        //
+        // Explicit override gerekirse: config key pipeline.maxSignedContentPages > 0
+        int configMaxPages = cfg.pipelineInt("maxSignedContentPages", 0);
+        final int maxSignedPages = Math.max(0, configMaxPages); // 0 = no limit
+        if (maxSignedPages > 0) {
+            plog("INFO", "Signed PDF page limit: {} content page(s) (maxSignedContentPages config)", maxSignedPages);
+        }
         if (signedPdf != null && signedParallel) {
             signedFuture = submitSignedExtract(docPool, signedPdf, allLanguages, ocrPages,
-                    runSignatureDetection, cp);
+                    runSignatureDetection, cp, maxSignedPages, extraPages);
         }
 
         // Faz B sonuçlarını topla — sıra korunmalı (original1, original2, ..., signed)
@@ -271,7 +300,7 @@ public final class Pipeline {
             plog("INFO", "Signed PDF extraction running sequentially (signedParallel=false)");
             signedFuture = submitSignedExtract(
                     Executors.newSingleThreadExecutor(), signedPdf, allLanguages,
-                    ocrPages, runSignatureDetection, cp);
+                    ocrPages, runSignatureDetection, cp, maxSignedPages, extraPages);
         }
         if (signedFuture != null) {
             if (debug) log.info("[DEBUG] Signed PDF Future bekleniyor...");
@@ -320,10 +349,16 @@ public final class Pipeline {
                     // firstPassResult: the cached extraction JSONObject for this language
                     final String langFinal = lang;
                     final java.util.Set<String> missingFinal = missingNos;
-                    JSONObject firstPassResult = cp.obj("signed." + lang + ".extract",
+                    // Hash-aware key: consistent with the extraction key computed in submitSignedExtract
+                    String pdfHashG   = Checkpoint.fileHash(signedPdf);
+                    String pass1Key   = "signed." + lang + ".extract"
+                            + (pdfHashG.isEmpty() ? "" : "." + pdfHashG);
+                    String guidedKey  = "signed." + lang + ".extract.guided"
+                            + (pdfHashG.isEmpty() ? "" : "." + pdfHashG);
+                    JSONObject firstPassResult = cp.obj(pass1Key,
                             () -> { throw new IOException("pass-1 cache missing for " + langFinal); });
 
-                    JSONObject guidedResult = cp.obj("signed." + lang + ".extract.guided",
+                    JSONObject guidedResult = cp.obj(guidedKey,
                             () -> {
                                 try {
                                     return az.clauseExtractionPDFSignedDocumentGuided(
@@ -391,15 +426,69 @@ public final class Pipeline {
             }
         }
 
+        // ---- 3.5 Extraction quality validation — validatePairing
+        // original1 (baseline) ile diğer dokümanlar arasındaki madde coverage'ını kontrol et.
+        // Düşük coverage → büyük olasılıkla segmentasyon hatası, genuine clause diff değil.
+        // Config key: pipeline.extractionQualityGate (default: true)
+        //   true  → severe finding (< 50% coverage) pipeline'ı durdurur (IOException)
+        //   false → sadece loglanır, süreç devam eder
+        boolean qualityGateEnabled = cfg.pipelineBoolean("extractionQualityGate", true);
+        if (docs.size() >= 2) {
+            DocAnalysis baseline = docs.get(0);
+            for (String lang : baseline.languages) {
+                Map<String, String> baseClauses = baseline.content.get(lang);
+                if (baseClauses == null || baseClauses.isEmpty()) continue;
+                java.util.Set<String> baseNos = baseClauses.keySet();
+                for (int di = 1; di < docs.size(); di++) {
+                    DocAnalysis other = docs.get(di);
+                    Map<String, String> otherClauses = other.content.get(lang);
+                    java.util.Set<String> otherNos = otherClauses != null
+                            ? otherClauses.keySet() : java.util.Collections.emptySet();
+                    java.util.List<extraction.ClauseExtractionValidator.Finding> findings =
+                            extraction.ClauseExtractionValidator.validatePairing(baseNos, otherNos);
+                    for (extraction.ClauseExtractionValidator.Finding f : findings) {
+                        if (f.severe) {
+                            plog("ERROR", "Extraction quality [{}→{} lang={}]: {}",
+                                    baseline.key, other.key, lang, f);
+                            if (qualityGateEnabled) {
+                                throw new IOException(
+                                        "Extraction quality gate FAILED [" + baseline.key + "→" + other.key
+                                        + " lang=" + lang + "]: " + f
+                                        + " — Set pipeline.extractionQualityGate=false to bypass.");
+                            }
+                        } else {
+                            plog("WARN", "Extraction quality [{}→{} lang={}]: {}",
+                                    baseline.key, other.key, lang, f);
+                        }
+                    }
+                }
+            }
+        }
+
         // ---- 4. merge
         if (debug) log.info("[DEBUG] Merge başlıyor — {} doküman", docs.size());
         long tMerge = System.currentTimeMillis();
-        JSONObject analyze = new AnalyzeMerger(cfg.pipelineDouble("renumberMatchThreshold", 0.85)).merge(docs);
+        JSONObject analyze = new AnalyzeMerger(cfg.pipelineDouble("renumberMatchThreshold", 0.92)).merge(docs);
         if (debug) log.info("[DEBUG] Merge tamamlandı — {}ms, languages: {}", System.currentTimeMillis() - tMerge,
                 analyze.optJSONArray("languages"));
         analyze.put("meta", new JSONObject()
                 .put("generated", OffsetDateTime.now().toString())
                 .put("steps", usedSteps));
+
+        // Extra pages (signature/annex pages beyond original page count) → base64 PNG list
+        // Stored under "extra_pages" so ReportBuilder can render them at the bottom of the report.
+        if (!extraPages.isEmpty()) {
+            org.json.JSONArray extraPagesB64 = new org.json.JSONArray();
+            for (java.awt.image.BufferedImage img : extraPages) {
+                try {
+                    extraPagesB64.put(util.Images.toBase64Png(img));
+                } catch (Exception e) {
+                    log.warn("Could not encode extra page image: {}", e.getMessage());
+                }
+            }
+            analyze.put("extra_pages", extraPagesB64);
+            log.info("Pipeline: {} extra page(s) added to analyze JSON", extraPages.size());
+        }
 
         // ---- 5. deterministic diff, 6. AI compare
         if (totalDocs >= 2) {
@@ -437,25 +526,53 @@ public final class Pipeline {
                                                      List<JSONObject> ocrPages,
                                                      boolean detectSigs,
                                                      Checkpoint cp) {
+        return submitSignedExtract(executor, pdf, allLanguages, ocrPages, detectSigs, cp, 0, null);
+    }
+
+    /** Submits the signed PDF extraction with a page limit.
+     *
+     * @param maxContentPages  0 = no limit; >0 = process only first N pages for clause extraction
+     * @param extraPagesOut    if non-null, rendered images of pages beyond maxContentPages are appended
+     */
+    private Future<DocAnalysis> submitSignedExtract(ExecutorService executor,
+                                                     File pdf,
+                                                     Set<String> allLanguages,
+                                                     List<JSONObject> ocrPages,
+                                                     boolean detectSigs,
+                                                     Checkpoint cp,
+                                                     int maxContentPages,
+                                                     List<java.awt.image.BufferedImage> extraPagesOut) {
         final List<String> langs = new ArrayList<>(allLanguages);
         final boolean debug = cfg.isDebug();
         plog("INFO", "Signed PDF languages (from original documents): {}", langs);
+        if (maxContentPages > 0) {
+            plog("INFO", "Signed PDF page limit: {} content page(s)", maxContentPages);
+        }
         return executor.submit(() -> {
             long t0 = System.currentTimeMillis();
-            if (debug) log.info("[DEBUG] Signed PDF extraction başlıyor — langs: {}, file: {}", langs, pdf.getName());
+            if (debug) log.info("[DEBUG] Signed PDF extraction başlıyor — langs: {}, file: {}, maxContentPages: {}",
+                    langs, pdf.getName(), maxContentPages > 0 ? maxContentPages : "unlimited");
             JSONObject signedAnalyze = new JSONObject();
             List<String> signedLangs = new ArrayList<>();
+            // PDF hash — checkpoint key'leri için bir kez hesapla (döngü dışında)
+            String pdfHash = Checkpoint.fileHash(pdf);
             // ocrPages: captured on the first language pass; subsequent languages reuse the checkpoint
             // cache and do NOT re-render pages, so we only need to capture once.
             for (int li = 0; li < langs.size(); li++) {
                 final String lang = langs.get(li);
                 final boolean captureOcr = (li == 0);
                 if (debug) log.info("[DEBUG] Signed PDF [{}] clauseExtract başlıyor (captureOcr={})", lang, captureOcr);
-                JSONObject extracted = cp.obj("signed." + lang + ".extract",
+                // Checkpoint key'e PDF dosya hash'i ekle — farklı PDF aynı outDir'e çalıştırıldığında
+                // stale cache replay'ini engeller.
+                String cpKey    = "signed." + lang + ".extract"
+                        + (pdfHash.isEmpty() ? "" : "." + pdfHash);
+                JSONObject extracted = cp.obj(cpKey,
                         () -> {
                             try {
                                 return az.clauseExtractionPDFSignedDocument(pdf, lang,
-                                        captureOcr ? ocrPages : null);
+                                        captureOcr ? ocrPages : null,
+                                        maxContentPages,
+                                        (captureOcr && extraPagesOut != null) ? extraPagesOut : null);
                             } catch (Exception e) {
                                 throw new RuntimeException(e);
                             }
@@ -478,7 +595,7 @@ public final class Pipeline {
             // 3b. signature detection (optional) — runs after all language extractions so ocrPages is full
             if (detectSigs) {
                 if (debug) log.info("[DEBUG] Signed PDF imza tespiti başlıyor — ocrPages: {}", ocrPages.size());
-                JSONArray signatures = cp.arr("signed.signatures",
+                JSONArray signatures = cp.arr("signed.signatures." + (pdfHash.isEmpty() ? "nohash" : pdfHash),
                         () -> {
                             try {
                                 return az.signatureDetection(pdf, ocrPages);
@@ -526,6 +643,10 @@ public final class Pipeline {
                         cmp.put("html", d.getString("html"));
                         cmp.put("html_base", d.getString("html_base"));
                         cmp.put("html_other", d.getString("html_other"));
+                        // Markdown-preserving word-level diff panels (del/ins spans inside Markdown)
+                        // Used by ReportBuilder.mdDiff() to render annotated text via CommonMark renderer.
+                        if (d.has("html_base_md")) cmp.put("html_base_md", d.getString("html_base_md"));
+                        if (d.has("html_other_md")) cmp.put("html_other_md", d.getString("html_other_md"));
                     }
                     cmps.put(other, cmp);
                 }
@@ -632,6 +753,23 @@ public final class Pipeline {
             l.add(a.getString(i));
         }
         return l;
+    }
+
+    /**
+     * Reads the page count from a DOCX file's extended properties metadata.
+     * Returns 0 when the metadata is absent or cannot be read (treat 0 as "no limit").
+     */
+    /**
+     * Reads the page count from a DOCX file's extended properties metadata.
+     * Returns 0 when the metadata is absent or cannot be read (treat 0 as "no limit").
+     */
+    private static int readDocxPageCount(File docxFile) {
+        try {
+            return DocxReader.pageCount(docxFile);
+        } catch (Exception e) {
+            log.debug("Could not read page count from {}: {}", docxFile.getName(), e.getMessage());
+            return 0;
+        }
     }
 
     private static List<String> languages(JSONObject analyze) {

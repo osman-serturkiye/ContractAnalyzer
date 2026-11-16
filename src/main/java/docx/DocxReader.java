@@ -36,6 +36,17 @@ import java.util.regex.Pattern;
  * Reads a DOCX into an ordered list of text blocks (paragraphs / tables-as-markdown).
  * Word auto-numbering (1. / 1.1 / a) ...) is resolved and prepended to the paragraph text, because
  * clause numbers are usually NOT part of the raw text.
+ *
+ * <p>Two numbering paths are supported:
+ * <ol>
+ *   <li><b>Auto-numbering</b> ({@link NumberingResolver}): paragraphs with a {@code <w:numPr>} element
+ *       — Word resolves the number display internally; we reconstruct it via the abstract-num definition.</li>
+ *   <li><b>Explicit-text numbering</b> ({@link ExplicitNumberExtractor}): paragraphs whose text begins
+ *       with a number token followed by a tab character — e.g. {@code "1.2\tAlıcı …"} or
+ *       {@code "(a)\tThe Buyer …"}.  The token is extracted, stripped from the text, and returned as the
+ *       prefix so the pipeline sees the same {@code "1.2 Alıcı …"} form as it does for auto-numbered
+ *       paragraphs.</li>
+ * </ol>
  */
 public final class DocxReader {
     private static final Logger log = LogManager.getLogger();
@@ -67,11 +78,50 @@ public final class DocxReader {
         }
     }
 
+    /**
+     * Returns the number of pages as recorded in the DOCX extended properties metadata.
+     *
+     * <p>Word stores the page count in {@code docProps/app.xml → Pages} during each save.
+     * This value may be stale if the document was saved without repaginating, but it is a
+     * good-enough upper bound for clause extraction — the signed PDF rarely has fewer pages
+     * of contractual content than the original DOCX.
+     *
+     * <p>Returns 0 when the metadata is absent or cannot be parsed (caller should treat 0
+     * as "no limit").
+     */
+    public static int pageCount(File file) throws IOException {
+        try (InputStream in = new FileInputStream(file); XWPFDocument doc = new XWPFDocument(in)) {
+            try {
+                int pages = doc.getProperties()
+                        .getExtendedProperties()
+                        .getUnderlyingProperties()
+                        .getPages();
+                return Math.max(0, pages);
+            } catch (Exception e) {
+                log.debug("DocxReader.pageCount: could not read page metadata from {}: {}", file.getName(), e.getMessage());
+                return 0;
+            }
+        }
+    }
+
     private DocxReader() {
     }
 
     public static List<Block> read(File file) throws IOException {
         try (InputStream in = new FileInputStream(file); XWPFDocument doc = new XWPFDocument(in)) {
+            // ── Tracked Changes detection ──
+            // Word'de kabul edilmemiş değişiklikler (w:ins / w:del) extraction'a sessizce
+            // giriyor: w:ins metni mevcut metin gibi okunur, w:del metni yok sayılır.
+            // Bu durum fraud detection'ı engeller: DOCX'te olmayan metin var gibi görünür
+            // veya var olan metin yok gibi görünür.
+            // Uyarı ver — Accept All Changes yapılmasını tavsiye et.
+            int trackedChanges = countTrackedChanges(doc);
+            if (trackedChanges > 0) {
+                log.warn("UYARI [DocxReader]: '{}' dosyasında {} adet kabul edilmemiş değişiklik (tracked change) " +
+                        "tespit edildi. Lütfen Word'de 'Accept All Changes' uygulayın ve dosyayı yeniden kaydedin. " +
+                        "Mevcut halde extraction yanlış metin içerebilir, fraud tespiti etkilenebilir.",
+                        file.getName(), trackedChanges);
+            }
             NumberingResolver numbering = new NumberingResolver(doc);
             List<Block> out = new ArrayList<>();
             int id = 0;
@@ -79,12 +129,32 @@ public final class DocxReader {
                 if (e instanceof XWPFParagraph) {
                     XWPFParagraph p = (XWPFParagraph) e;
                     String t = paragraphToMarkdown(p);
-                    String prefix = numbering.prefix(p);
                     if (t.isEmpty()) {
                         continue;
                     }
+                    // ── Numbering: auto (Word numPr) → explicit text (tab/space) → none ──
+                    String prefix = numbering.prefix(p);
+                    String body   = t;
+                    if (prefix.isEmpty()) {
+                        // Try explicit-text numbering: "1.2\tAlıcı…", "(a)\tBuyer…", "3.10.1. YÜKLENİCİ…"
+                        String[] ep = ExplicitNumberExtractor.extract(t);
+                        if (ep != null) {
+                            prefix = ep[0];   // the number token ("1.2", "(a)", etc.)
+                            body   = ep[1];   // text with the token + separator stripped
+                        }
+                    }
                     String headingPrefix = headingPrefix(p);
-                    String full = prefix.isEmpty() ? t : prefix + " " + t;
+                    // ── Visual heading detection ──
+                    // No number, no Word heading style, but the paragraph looks like a heading
+                    // (all-caps, short).  Mark it with ## so the LLM and deterministic pre-pass
+                    // can use it for clause comparison and fraud detection.
+                    // These are NOT skipped — they are visible to the pipeline.
+                    // Guard: only apply when no clause number was extracted (prefix is empty).
+                    if (headingPrefix.isEmpty() && prefix.isEmpty()
+                            && ExplicitNumberExtractor.isHeadingLike(t)) {
+                        headingPrefix = "##";
+                    }
+                    String full = prefix.isEmpty() ? body : prefix + " " + body;
                     if (!headingPrefix.isEmpty()) {
                         full = headingPrefix + " " + full;
                     }
@@ -221,6 +291,56 @@ public final class DocxReader {
         return s == null ? "" : s.replace('\u00A0', ' ').replaceAll("\\s+", " ").trim();
     }
 
+    // ------------------------------------------------------------------ Tracked changes detection
+
+    /**
+     * Counts the total number of pending tracked-change insertions and deletions in the document.
+     *
+     * <p>Apache POI does not expose a high-level revision API, so we walk the raw XML using
+     * the XmlBeans layer. We count {@code <w:ins>} and {@code <w:del>} run-level elements
+     * directly under paragraph run containers — these represent accepted-but-not-committed
+     * insertions and deletions respectively.</p>
+     *
+     * <p>Returns 0 when the document has no pending changes or when the XML cannot be
+     * inspected (graceful fallback).</p>
+     */
+    public static int countTrackedChanges(XWPFDocument doc) {
+        try {
+            // Use the raw XML string to count w:ins and w:del occurrences.
+            // This is simpler than recursing through XmlBeans objects and covers
+            // all nesting levels (runs, tables, paragraphs).
+            String xml = doc.getDocument().xmlText();
+            int insCount = countOccurrences(xml, "<w:ins ");
+            int delCount = countOccurrences(xml, "<w:del ");
+            return insCount + delCount;
+        } catch (Exception e) {
+            log.debug("countTrackedChanges: could not inspect XML ({})", e.getMessage());
+            return 0;
+        }
+    }
+
+    /**
+     * Returns {@code true} when the DOCX file contains any pending tracked-change
+     * insertions or deletions. Convenience method for callers that only need a boolean.
+     */
+    public static boolean hasTrackedChanges(File file) {
+        try (InputStream in = new FileInputStream(file); XWPFDocument doc = new XWPFDocument(in)) {
+            return countTrackedChanges(doc) > 0;
+        } catch (Exception e) {
+            log.debug("hasTrackedChanges: could not open {} ({})", file.getName(), e.getMessage());
+            return false;
+        }
+    }
+
+    private static int countOccurrences(String text, String pattern) {
+        int count = 0, idx = 0;
+        while ((idx = text.indexOf(pattern, idx)) >= 0) {
+            count++;
+            idx += pattern.length();
+        }
+        return count;
+    }
+
     /**
      * Returns true when the table looks like a bilingual side-by-side layout:
      * - Exactly 2 columns in the majority of data rows.
@@ -270,29 +390,32 @@ public final class DocxReader {
                 String t = paragraphToMarkdown(p);
                 if (t.isEmpty()) continue;
                 String prefix = numbering.prefix(p);
+                String body   = t;
+                if (prefix.isEmpty()) {
+                    String[] ep = ExplicitNumberExtractor.extract(t);
+                    if (ep != null) {
+                        prefix = ep[0];
+                        body   = ep[1];
+                    }
+                }
                 String headingPrefix = headingPrefix(p);
-                String full = prefix.isEmpty() ? t : prefix + " " + t;
+                if (headingPrefix.isEmpty() && prefix.isEmpty()
+                        && ExplicitNumberExtractor.isHeadingLike(t)) {
+                    headingPrefix = "##";
+                }
+                String full = prefix.isEmpty() ? body : prefix + " " + body;
                 if (!headingPrefix.isEmpty()) full = headingPrefix + " " + full;
                 if (sb.length() > 0) sb.append('\n');
                 sb.append(full);
             } else if (e instanceof XWPFTable) {
                 XWPFTable nested = (XWPFTable) e;
-                // Nested bilingual tables: flatten same-column cells into running text.
-                // This handles the common pattern where each clause is a row in a nested table.
-                if (isBilingualTable(nested)) {
-                    // Collect only the matching column from the nested table — caller decides column.
-                    // Since we don't know the target column here, flatten ALL cells with a separator.
-                    String md = tableToMarkdown(nested);
-                    if (!md.trim().isEmpty()) {
-                        if (sb.length() > 0) sb.append('\n');
-                        sb.append(md);
-                    }
-                } else {
-                    String md = tableToMarkdown(nested);
-                    if (!md.trim().isEmpty()) {
-                        if (sb.length() > 0) sb.append('\n');
-                        sb.append(md);
-                    }
+                // Nested tables (bilingual or not) are rendered as markdown.
+                // The old code had separate if/else branches for bilingual vs non-bilingual
+                // nested tables, but both did the same thing — consolidated here.
+                String md = tableToMarkdown(nested);
+                if (!md.trim().isEmpty()) {
+                    if (sb.length() > 0) sb.append('\n');
+                    sb.append(md);
                 }
             }
         }
@@ -330,6 +453,166 @@ public final class DocxReader {
             }
         }
         return sb.toString().trim();
+    }
+
+    // ------------------------------------------------------------------
+    // Explicit-text number extractor
+    // Handles paragraphs where the clause number is embedded as explicit text
+    // followed by a tab: "1.2\tAlıcı …", "(a)\tThe Buyer …", "1.2.3\tScope".
+    // This is common in DOCX files that use tabs for alignment instead of Word
+    // auto-numbering, or where auto-numbering is disabled / inherited from a template
+    // that emits the number as literal text.
+    //
+    // A contract can use MULTIPLE numbering patterns simultaneously:
+    //   - "1." / "1.1" / "1.2.3" (dotted Arabic)
+    //   - "(a)" / "(1)" / "(iv)" (parenthesized)
+    //   - "a)" / "1)" (trailing-paren)
+    //   - "Madde 5" / "Article 3" (keyword)
+    //   - Tab-separated: "1.2\tAlıcı…"
+    //   - Space-separated: "3.10.1. YÜKLENİCİ…"
+    // All of these must be recognised so every paragraph is correctly assigned
+    // to its clause — missing or misassigned blocks directly cause missed diffs
+    // in the fraud-detection comparison.
+
+    static final class ExplicitNumberExtractor {
+
+        // Full number token: (A) | (a) | (1) | (iv)  OR  1 | 1. | 1.2 | 1.2.3 | 1.2.3.
+        private static final String NUM_TOKEN =
+                "\\(\\s*(?:\\d+|[A-Za-z]{1,4})\\s*\\)" +   // (A) (a) (1) (iv)
+                "|" +
+                "\\d+(?:\\.\\d+)*\\.?";                     // 1 | 1. | 1.2 | 1.2.3 | 1.2.3.
+
+        // "Safe" token for space-separated matching: only patterns that are very
+        // unlikely to appear as non-clause text.  Single bare integers ("1 yıl",
+        // "3 days") are EXCLUDED — they cause too many false positives.
+        //   - Parenthesized: (a) (1) (iv) — always a sub-clause marker
+        //   - Multi-level dotted: 1.2 1.2.3 — always a clause number
+        //   - Trailing-paren: 1) a) — sub-clause or list item
+        //   - Single trailing-dot: 1. 2. — clause number (moderately safe)
+        private static final String NUM_TOKEN_SAFE =
+                "\\(\\s*(?:\\d+|[A-Za-z]{1,4})\\s*\\)"      // (A) (a) (1) (iv)
+                + "|" +
+                "\\d+\\.\\d+(?:\\.\\d+)*\\.?"                 // 1.2 1.2.3 1.2.3. — multi-level (2+ components)
+                + "|" +
+                "(?:\\d{1,2}|[a-zA-Z])\\)"                     // 1) a) A) — trailing-paren
+                + "|" +
+                "\\d+\\.(?=\\s)"                               // 1. 2. — single trailing-dot + space
+                ;
+
+        // Tab-separated: number + tab (most reliable — tab is a structural separator)
+        private static final Pattern PARA_NUMBER_TAB =
+                Pattern.compile("^\\s*(" + NUM_TOKEN + ")\\t");
+
+        // Space-separated: number + whitespace + body
+        // Only for safe patterns — avoids "1 yıl" / "3 days" false positives.
+        private static final Pattern PARA_NUMBER_SPACE =
+                Pattern.compile("^\\s*(" + NUM_TOKEN_SAFE + ")\\s+(.*)", Pattern.DOTALL);
+
+        /**
+         * Attempts to extract an explicit number prefix from a paragraph's rendered text.
+         *
+         * <p>Two matching strategies are tried in order:
+         * <ol>
+         *   <li><b>Tab-separated</b> ({@code "1.2\tAlıcı…"}): the most reliable form —
+         *       a tab is a structural separator, not used in running prose.</li>
+         *   <li><b>Space-separated</b> ({@code "3.10.1. YÜKLENİCİ…"}): only "safe" patterns
+         *       (multi-level dotted, parenthesized, trailing-paren) are matched to avoid
+         *       false positives like {@code "1 yıl"} or {@code "3 days"}.</li>
+         * </ol>
+         *
+         * @param text the full rendered text of the paragraph (from {@link #paragraphToMarkdown})
+         * @return a two-element array {@code [prefix, body]} where {@code prefix} is the extracted
+         *         number token (e.g. {@code "1.2"}) and {@code body} is the remaining text with the
+         *         token and separator stripped; or {@code null} if no explicit number is found.
+         */
+        static String[] extract(String text) {
+            if (text == null || text.isEmpty()) return null;
+
+            // 1. Tab-separated: "1.2\tAlıcı…" — most reliable
+            Matcher m = PARA_NUMBER_TAB.matcher(text);
+            if (m.find()) {
+                String token = m.group(1).replaceAll("\\s+", "");
+                String body  = text.substring(m.end()).trim();
+                if (body.isEmpty()) return null;
+                return new String[]{token, body};
+            }
+
+            // 2. Space-separated on raw text: "3.10.1. YÜKLENİCİ…" or "(a) yaptırım…"
+            //    Only for safe patterns — avoids "1 yıl" false positives.
+            Matcher sm = PARA_NUMBER_SPACE.matcher(text);
+            if (sm.find()) {
+                String token = sm.group(1).replaceAll("\\s+", "");
+                String body  = sm.group(2).trim();
+                if (body.isEmpty()) return null;
+                return new String[]{token, body};
+            }
+
+            // 3. Markdown-stripped fallback: paragraphToMarkdown() wraps bold/italic text
+            //    in ** or * markers — "**1.2. SUMP POMPA**" fails the patterns above.
+            //    Strip all leading markdown markers and retry the space-separated match.
+            //    This handles paragraphs whose clause number is bold in Word.
+            String stripped = text.replaceAll("^[*_#`\\s]+", "").trim();
+            if (!stripped.equals(text.trim())) {
+                // Try tab-separated on stripped
+                Matcher mt = PARA_NUMBER_TAB.matcher(stripped);
+                if (mt.find()) {
+                    String token = mt.group(1).replaceAll("\\s+", "");
+                    String body  = stripped.substring(mt.end()).replaceAll("[*_]+$", "").trim();
+                    if (!body.isEmpty()) return new String[]{token, body};
+                }
+                // Try space-separated on stripped
+                Matcher ms2 = PARA_NUMBER_SPACE.matcher(stripped);
+                if (ms2.find()) {
+                    String token = ms2.group(1).replaceAll("\\s+", "");
+                    // Remove trailing markdown from body
+                    String body  = ms2.group(2).replaceAll("[*_]+$", "").trim();
+                    if (!body.isEmpty()) return new String[]{token, body};
+                }
+            }
+
+            return null;
+        }
+
+        /**
+         * Detects visual headings — paragraphs that look like section headings
+         * even though they have no Word heading style and no clause number.
+         *
+         * <p>These are NOT skipped (unlike the old all-caps-colon guard which
+         * returned {@code null}).  Instead they are marked with a {@code ##}
+         * prefix so the pipeline can use them for clause comparison and
+         * fraud detection.
+         *
+         * <p>Heuristics:
+         * <ul>
+         *   <li>All-uppercase text (allowing spaces, colons, dots, hyphens)</li>
+         *   <li>At least 3 letters (not just "I:" or "A:")</li>
+         *   <li>Short (≤ 80 chars) — a heading, not a paragraph</li>
+         * </ul>
+         *
+         * <p>Examples: {@code "TARAFLAR:"}, {@code "KONU"}, {@code "GENEL HÜKÜMLER"},
+         * {@code "TANIMLAR:"}, {@code "İŞİN YAPILMASI:"}.
+         */
+        static boolean isHeadingLike(String text) {
+            if (text == null || text.isEmpty()) return false;
+            String t = text.trim();
+            if (t.isEmpty()) return false;
+            // Must have at least 3 letters
+            long letterCount = t.chars().filter(Character::isLetter).count();
+            if (letterCount < 3) return false;
+            // Short — a heading, not a paragraph
+            if (t.length() > 80) return false;
+            // Strip leading markdown markers before checking case
+            String stripped = t.replaceAll("^[*_#`\\s]+", "").trim();
+            // Guard: if the stripped text starts with a clause number (e.g. "1.2. SUMP POMPA"),
+            // it is NOT a heading — it is a numbered paragraph that ExplicitNumberExtractor
+            // should handle. Without this guard, "**1.2. SUMP POMPA**" gets "##" injected and
+            // the clause number becomes invisible to the LLM.
+            if (stripped.matches("^\\d+[.\\d]*[.\\s].*")) return false;
+            if (stripped.matches("^\\(\\w+\\).*")) return false;
+            // All-uppercase (non-letter chars like spaces, colons, dots are OK)
+            if (!t.equals(t.toUpperCase(java.util.Locale.ROOT))) return false;
+            return true;
+        }
     }
 
     /** Computes list numbers ("1.", "1.1", "a)") the way Word would display them (decimal/letters/roman). */

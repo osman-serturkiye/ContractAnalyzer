@@ -43,6 +43,14 @@ public final class DocxClauseExtractor {
         StepAi ai = router.get("clauseExtractionDOCOriginalDocument");
         int chunkChars = cfg.pipelineInt("docxChunkChars", 24000);
         boolean debug = cfg.isDebug();
+        // docxParenSubclauses: parantezli öğelerin (a)/(b)/(1) sub-clause olarak çıkarılıp
+        // çıkarılmayacağı. pdfParenSubclauses ile aynı mantık — iki taraf tutarlı olsun.
+        // Default false: (a)/(b)/(1) öğeleri varsayılan olarak body'e alınır.
+        boolean parenEnabled = cfg.pipelineBoolean("docxParenSubclauses",
+                cfg.pipelineBoolean("pdfParenSubclauses", false));
+        if (!parenEnabled) {
+            log.info("DOCX [{}]: parenthesized sub-clause synthesis disabled (docxParenSubclauses=false)", lang);
+        }
 
         // Çift kolonlu tablo yapısı tespiti:
         // columnIndex >= 0 olan bloklar varsa bu bir bilingual DOCX'tir.
@@ -67,6 +75,37 @@ public final class DocxClauseExtractor {
 
         int totalBlockChars = workingBlocks.stream().mapToInt(b -> b.text == null ? 0 : b.text.length()).sum();
         log.info("DOCX [{}] clauseExtract — {} blok, toplam {} karakter", lang, workingBlocks.size(), totalBlockChars);
+
+        // ── Deterministic pre-pass: H1/H2 heading bloklarından kesin madde başlıklarını çıkar ──
+        // Word'ün H1/H2 heading style'ı ile işaretlenmiş bloklar çok güvenilir birer başlıktır.
+        // Bu bloklar için madde numarasını ClauseNumbering ile deterministik olarak tespit edip
+        // "found" map'ine ekleriz. LLM'e gidecek bloklardan bunları çıkarmak gerekmez —
+        // LLM kararını almaya devam eder, ama deterministik sonuç LLM'in KAÇIRDIĞI maddeleri kapatır.
+        Map<String, TreeSet<Integer>> detPreFound = new LinkedHashMap<>();
+        String detPrev = "";
+        for (int idx = 0; idx < workingBlocks.size(); idx++) {
+            Block b = workingBlocks.get(idx);
+            String styleLabel = normalizeStyle(b.style);
+            if (styleLabel != null && (styleLabel.equals("H1") || styleLabel.equals("H2")
+                    || styleLabel.equals("H3") || styleLabel.equals("H4"))) {
+                String stripped = extraction.ClauseNumbering.stripArtifactPrefix(
+                        extraction.ClauseNumbering.stripMarkdownPrefix(b.text.trim()));
+                extraction.ClauseNumbering.ParseResult pr = extraction.ClauseNumbering.parse(stripped);
+                if (pr != null) {
+                    extraction.ClauseNumbering.Relation rel =
+                            extraction.ClauseNumbering.classify(detPrev.isEmpty() ? null : detPrev, pr.normalized);
+                    if (rel != extraction.ClauseNumbering.Relation.INVALID) {
+                        detPreFound.computeIfAbsent(pr.normalized, k -> new TreeSet<>()).add(idx);
+                        detPrev = pr.normalized;
+                    }
+                }
+            }
+        }
+        if (!detPreFound.isEmpty()) {
+            log.info("DOCX [{}] deterministic pre-pass: {} clause heading(s) found via H1-H4 style",
+                    lang, detPreFound.size());
+        }
+
         List<List<Block>> chunks = chunk(workingBlocks, chunkChars);
         if (debug) log.info("[DEBUG] DocxClauseExtractor [{}] başlıyor — {} blok, {} chunk, chunkChars:{}",
                 lang, workingBlocks.size(), chunks.size(), chunkChars);
@@ -82,7 +121,7 @@ public final class DocxClauseExtractor {
                     chunk.isEmpty() ? "?" : chunk.get(0).id);
             String resp;
             try {
-                resp = ai.chat(SYSTEM, prompt(lang, chunk, prev), List.of());
+                resp = ai.chat(SYSTEM, prompt(lang, chunk, prev, parenEnabled), List.of());
             } catch (IOException e) {
                 log.warn("DOCX [{}] extraction: chunk starting at block {} failed ({}), skipping chunk",
                         lang, chunk.isEmpty() ? "?" : chunk.get(0).id, e.getMessage());
@@ -110,6 +149,47 @@ public final class DocxClauseExtractor {
                 String no = ClauseNumber.normalize(c.optString("number", ""));
                 if (no == null) continue;
 
+                // docxParenSubclauses=false → yalnızca LLM'in sentezlediği parantezli
+                // sub-clause numaralarını reddet.
+                //
+                // Sentez testi: bu chunk'taki block metinlerinin hiçbiri "no" ile başlamıyorsa
+                // (explicit metin yok) → LLM bunu (1)/(a) gibi bir parantezden türetti → reddet.
+                // Eğer block'lardan en az biri "no" ile başlıyorsa explicit metin var → geçir.
+                //
+                // Neden değişti: eski koşul sadece derinliğe bakıyordu (depth==prevDepth+1 &&
+                // prevDepth>=2). Bu 3.2.1 / 3.2.2 gibi meşru üçüncü seviye maddeleri de
+                // yutuyordu — DOCX'te açıkça "3.2.1" yazıyor olsa bile.
+                // parseIds bir kez çağrılır — hem depth filter hem ana atama için
+                List<Integer> ids = parseIds(c.opt("blocks"), workingBlocks.size());
+
+                if (!parenEnabled && no.contains(".")) {
+                    long depth = no.chars().filter(ch -> ch == '.').count() + 1;
+                    long prevDepth = prev.isEmpty() ? 0 : prev.chars().filter(ch -> ch == '.').count() + 1;
+                    if (depth == prevDepth + 1 && prevDepth >= 2) {
+                        // Sadece sentezlenmiş numaraları reddet: explicit metin kontrolü
+                        boolean hasExplicitText = false;
+                        for (int bid : ids) {
+                            if (bid >= 0 && bid < workingBlocks.size()) {
+                                String bt = extraction.ClauseNumbering.stripMarkdownPrefix(
+                                        workingBlocks.get(bid).text.trim());
+                                extraction.ClauseNumbering.ParseResult bpr =
+                                        extraction.ClauseNumbering.parse(bt);
+                                if (bpr != null && bpr.normalized.equals(no)) {
+                                    hasExplicitText = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if (!hasExplicitText) {
+                            log.debug("DOCX [{}] clause {} skipped — docxParenSubclauses=false, synthesized (no explicit text), depth={} after prev='{}'",
+                                    lang, no, depth, prev);
+                            continue;
+                        }
+                        log.debug("DOCX [{}] clause {} kept — docxParenSubclauses=false but explicit text found, depth={} after prev='{}'",
+                                lang, no, depth, prev);
+                    }
+                }
+
                 // Ardıllık doğrulama: sadece INVALID reddedilir.
                 // VALID, DUPLICATE, RESET ve BACKWARD kabul edilir.
                 // - RESET: parent atlanarak alt-maddeye giriş (örn. "6.4"→"7.1", "9.4"→"11.1")
@@ -121,7 +201,7 @@ public final class DocxClauseExtractor {
                     log.debug("DOCX [{}] clause {} rejected ({}) — prev='{}'", lang, no, rel, prev);
                     continue;
                 }
-                List<Integer> ids = parseIds(c.opt("blocks"), workingBlocks.size());
+                // ids zaten yukarıda parseIds ile hesaplandı
                 if (ids.isEmpty()) {
                     log.warn("DOCX [{}] clause {}: no valid block ids in AI response (blocks={}), skipping",
                             lang, no, c.opt("blocks"));
@@ -132,15 +212,103 @@ public final class DocxClauseExtractor {
             }
         }
 
+        // ── Deterministic supplement: LLM'in kaçırdığı H1-H4 heading bloklarını kurtarma ──
+        // detPreFound içindeki maddeler LLM sonucunda yoksa ekle (LLM pass-1 wins).
+        int detSupplCount = 0;
+        for (Map.Entry<String, TreeSet<Integer>> e : detPreFound.entrySet()) {
+            if (!found.containsKey(e.getKey())) {
+                // Block index'lerini genişlet: bu heading bloğundan sonraki body bloklarını da ekle
+                // (bir sonraki madde başlığına kadar).
+                TreeSet<Integer> headingIdx = e.getValue();
+                int firstIdx = headingIdx.first();
+                // Bir sonraki deterministik heading'i bul
+                int nextHeadingIdx = workingBlocks.size();
+                for (String otherNo : detPreFound.keySet()) {
+                    if (!otherNo.equals(e.getKey())) {
+                        int otherFirst = detPreFound.get(otherNo).first();
+                        if (otherFirst > firstIdx && otherFirst < nextHeadingIdx) {
+                            nextHeadingIdx = otherFirst;
+                        }
+                    }
+                }
+                // Heading + body bloklarını topla
+                TreeSet<Integer> allIdx = new TreeSet<>(headingIdx);
+                for (int idx = firstIdx + 1; idx < nextHeadingIdx; idx++) {
+                    // LLM'in başka bir maddeye zaten atadığı bloğu alma
+                    final int fi = idx;
+                    boolean claimedByLlm = found.values().stream().anyMatch(s -> s.contains(fi));
+                    if (!claimedByLlm) allIdx.add(idx);
+                }
+                found.put(e.getKey(), allIdx);
+                detSupplCount++;
+                log.info("DOCX [{}] deterministic supplement: clause {} recovered (H-style heading, LLM missed)",
+                        lang, e.getKey());
+            }
+        }
+        if (detSupplCount > 0) {
+            log.info("DOCX [{}]: {} clause(s) recovered via deterministic pre-pass supplement", lang, detSupplCount);
+        }
+
         // İçerik birleştirme: workingBlocks üzerinden indeksleme
         // Not: AI workingBlocks içindeki lokal indeksleri döndürür (0..workingBlocks.size()-1)
+        //
+        // TABLE guard: "table" kind'ı olan bloklar madde başlığı olamaz.
+        // LLM yanlış atasa bile — tablo bloğu tek başına bir clauseKey altındaysa
+        // önceki clause'a taşı; önceki clause yoksa body olarak bırak.
+        // Bu, S6#2 / S8#1 / S10#2 gibi tabloların kendi başına madde olarak görünmesini önler.
+        {
+            // Tablo bloğu → clause key mapping (tersine çevrilmiş: blockIdx → clauseKey)
+            Map<Integer, String> blockToClause = new java.util.LinkedHashMap<>();
+            for (Map.Entry<String, TreeSet<Integer>> e : found.entrySet()) {
+                for (int idx : e.getValue()) {
+                    blockToClause.put(idx, e.getKey());
+                }
+            }
+
+            // Sıralı clause key listesi (found'da ekleme sırası: LLM pass sırası)
+            List<String> clauseOrder = new ArrayList<>(found.keySet());
+
+            // Her tablo bloğu için: bu bloğun atandığı clause'da başka blok var mı?
+            // Yoksa → bu clause sadece tablodan ibaret → bir önceki clause'a taşı.
+            List<String> clausesToRemove = new ArrayList<>();
+            for (int ci = 0; ci < clauseOrder.size(); ci++) {
+                String key = clauseOrder.get(ci);
+                TreeSet<Integer> indices = found.get(key);
+                // Bu clause'daki tüm bloklar tablo mu?
+                boolean allTables = !indices.isEmpty() && indices.stream().allMatch(idx ->
+                        idx >= 0 && idx < workingBlocks.size()
+                        && "table".equals(workingBlocks.get(idx).kind));
+                if (!allTables) continue;
+
+                // Hedef: bir önceki clause (clauseOrder'da)
+                String prevKey = ci > 0 ? clauseOrder.get(ci - 1) : null;
+                if (prevKey == null) {
+                    // İlk clause tamamen tablo — body'e bırak (başka yapacak şey yok)
+                    continue;
+                }
+                // Blokları önceki clause'a aktar
+                found.get(prevKey).addAll(indices);
+                clausesToRemove.add(key);
+                log.info("DOCX [{}] TABLE guard: clause '{}' (table-only) merged into '{}'", lang, key, prevKey);
+            }
+            for (String k : clausesToRemove) {
+                found.remove(k);
+            }
+        }
+
         JSONObject clauses = new JSONObject();
         for (Map.Entry<String, TreeSet<Integer>> e : found.entrySet()) {
             StringBuilder sb = new StringBuilder();
             for (int idx : e.getValue()) {
                 if (idx < 0 || idx >= workingBlocks.size()) continue;
                 if (sb.length() > 0) sb.append("\n\n");
-                sb.append(workingBlocks.get(idx).text);
+                // Strip leading markdown heading markers (## ###) injected by DocxReader's
+                // visual-heading detection — they are style signals, not content.
+                // Without this, DOCX "## TARAFLAR:" vs PDF "TARAFLAR:" produces a
+                // spurious "##" diff token in the fraud-detection comparison.
+                String blockText = workingBlocks.get(idx).text;
+                blockText = blockText.replaceAll("^#{1,6}\\s+", "");
+                sb.append(blockText);
             }
             if (sb.length() == 0) continue;
             clauses.put(e.getKey(), new JSONObject()
@@ -227,15 +395,52 @@ public final class DocxClauseExtractor {
     }
 
     private static String line(Block b) {
-        return "[" + b.id + (b.style != null ? "|" + b.style : "") + "] " + Json.abbreviate(b.text, 1200) + "\n";
+        // Style normalization: "Heading1"/"heading1"/"1" → "H1", "Heading2" → "H2", vb.
+        // LLM'e geçirilen [id|style] alanı böylece tutarlı ve açıklayıcı olur.
+        // "table" kind'ı TABLE olarak işaretlenir — LLM bu blokları her zaman önceki maddeye atar.
+        String styleLabel;
+        if ("table".equals(b.kind)) {
+            styleLabel = "TABLE";
+        } else {
+            styleLabel = normalizeStyle(b.style);
+        }
+        return "[" + b.id + (styleLabel != null ? "|" + styleLabel : "") + "] " + Json.abbreviate(b.text, 1200) + "\n";
     }
 
-    private static String prompt(String lang, List<Block> chunk, String prev) {
+    /**
+     * Word style ID'sini LLM-dostu kısa etikete dönüştürür.
+     * "Heading1" / "heading 1" / "1" → "H1"
+     * "Normal" / "BodyText" → null (style label eklenmez)
+     */
+    private static String normalizeStyle(String sid) {
+        if (sid == null) return null;
+        String norm = sid.toLowerCase().replace(" ", "").replace("-", "");
+        if (norm.startsWith("heading")) {
+            String rest = norm.substring("heading".length());
+            try { int lvl = Integer.parseInt(rest); return "H" + lvl; } catch (NumberFormatException ignored) {}
+        }
+        // Plain numeric style IDs "1"…"6" → heading
+        try {
+            int lvl = Integer.parseInt(norm);
+            if (lvl >= 1 && lvl <= 6) return "H" + lvl;
+        } catch (NumberFormatException ignored) {}
+        // Keep other non-trivial styles (table-cell, listparagraph, etc.)
+        if (norm.equals("normal") || norm.equals("bodytext") || norm.equals("defaultparagraphfont")
+                || norm.equals("texttekst") || norm.startsWith("body")) return null;
+        // Truncate to keep prompt compact
+        return sid.length() > 20 ? sid.substring(0, 20) : sid;
+    }
+
+    private static String prompt(String lang, List<Block> chunk, String prev, boolean parenEnabled) {
         StringBuilder sb = new StringBuilder();
         sb.append("TARGET LANGUAGE: ").append(lang).append(". The document may contain several languages; ignore blocks that are ")
                 .append("not written in the target language.\n")
-                .append("Below, the document is given as blocks: [id|style] text. Tables are markdown. Automatic list numbers ")
-                .append("(1. / 1.1 / a)) are already prepended to the text when known.\n\n")
+                .append("Below, the document is given as blocks: [id|style] text.\n")
+                .append("  - style is H1/H2/H3/H4/H5/H6 for Word heading paragraphs (H1=top, H6=lowest), or omitted for body text.\n")
+                .append("  - H1/H2 blocks are ALWAYS clause headings. H3/H4 are likely sub-clause headings.\n")
+                .append("  - Blocks marked TABLE are Word tables already rendered as markdown (pipe-separated). ")
+                .append("A TABLE block is NEVER a clause heading — always assign it to the SAME clause as the block immediately preceding it.\n")
+                .append("  - Tables are already in markdown. Automatic list numbers (1. / 1.1 / a)) are already prepended to the text when known.\n\n")
                 .append("Segment the blocks into numbered clauses and sub-clauses (e.g. 1, 1.1, 1.2, 2.3.4).\n")
                 .append("CLAUSE NUMBERING FORMATS: Clauses may be numbered in many ways. Recognize ALL of the following as numbered clauses:\n")
                 .append("  - Arabic numerals: \"1\", \"1.1\", \"2.3.4\"\n")
@@ -244,20 +449,31 @@ public final class DocxClauseExtractor {
                 .append("  - Word+numeral (French): \"Article 1\", \"Art. 1\"\n")
                 .append("  - Word+numeral (English): \"Article 1\", \"Section 1\", \"Clause 1\"\n")
                 .append("  - Word+numeral (Arabic): \"المادة 1\"\n")
-                .append("  - Roman numerals used as top-level clause numbers: \"I\", \"II\", \"III\"\n")
-                .append("  - Parenthesized decimal sub-clauses (very common in English/international contracts): ")
-                .append("\"(1)\", \"(2)\", \"(3)\" — these are sub-clauses ONLY when their content is a full obligation/right/condition (typically 50+ characters).\n")
-                .append("    Example: inside clause 4, the sequence (1), (2), (3) maps to \"4.1\", \"4.2\", \"4.3\".\n")
-                .append("    EXCEPTION: Short definition list items like \"(a) United States;\", \"(b) United Kingdom;\" are NOT sub-clauses — assign them to the parent clause body.\n")
-                .append("  - Parenthesized letter sub-clauses: \"(a)\", \"(b)\", \"(c)\" — sub-clauses of the enclosing clause ONLY when substantive (50+ chars).\n")
-                .append("    Example: inside clause 5, the sequence (a), (b) maps to \"5.1\", \"5.2\".\n")
-                .append("    EXCEPTION: Short items like \"(a) Amerika Birleşik Devletleri;\", \"(b) Birleşik Krallık;\" are definition-list items — keep in parent clause body.\n")
-                .append("  - Parenthesized roman numeral sub-clauses: \"(i)\", \"(ii)\", \"(iii)\" — sub-clauses of the enclosing clause.\n")
-                .append("    Example: inside clause 5.1, the sequence (i), (ii) maps to \"5.1.1\", \"5.1.2\".\n")
-                .append("For the \"number\" field always use Arabic digits and dots only:\n")
-                .append("  \"Madde 3\" → \"3\", \"§ 2.1\" → \"2.1\", \"Article 5\" → \"5\",\n")
-                .append("  \"(1)\" inside clause 4 → \"4.1\", \"(b)\" inside clause 4 → \"4.2\".\n")
-                .append("If a block clearly marks the start of a new section/clause even without a visible number (e.g. a bold all-caps heading that begins a section), ")
+                .append("  - Roman numerals used as top-level clause numbers: \"I\", \"II\", \"III\"\n");
+        if (parenEnabled) {
+            sb.append("  - Parenthesized decimal sub-clauses (very common in English/international contracts): ")
+              .append("\"(1)\", \"(2)\", \"(3)\" — these are sub-clauses ONLY when their content is a full obligation/right/condition (typically 100+ characters).\n")
+              .append("    Example: inside clause 4, the sequence (1), (2), (3) maps to \"4.1\", \"4.2\", \"4.3\".\n")
+              .append("    EXCEPTION: Short definition list items like \"(a) United States;\", \"(b) United Kingdom;\" are NOT sub-clauses — assign them to the parent clause body.\n")
+              .append("  - Parenthesized letter sub-clauses: \"(a)\", \"(b)\", \"(c)\" — sub-clauses of the enclosing clause ONLY when substantive (100+ chars).\n")
+              .append("    Example: inside clause 5, the sequence (a), (b) maps to \"5.1\", \"5.2\".\n")
+              .append("    EXCEPTION: Short items like \"(a) Amerika Birleşik Devletleri;\", \"(b) Birleşik Krallık;\" are definition-list items — keep in parent clause body.\n")
+              .append("    EXCEPTION: If there are 7 or more such items, they form an enumeration list — keep ALL in parent clause body.\n")
+              .append("  - Parenthesized roman numeral sub-clauses: \"(i)\", \"(ii)\", \"(iii)\" — sub-clauses of the enclosing clause.\n")
+              .append("    Example: inside clause 5.1, the sequence (i), (ii) maps to \"5.1.1\", \"5.1.2\".\n");
+        } else {
+            sb.append("  IMPORTANT: Parenthesized items \"(a)\", \"(b)\", \"(c)\", \"(1)\", \"(2)\", \"(i)\", \"(ii)\" etc. are NEVER sub-clauses in this document.\n")
+              .append("    Assign ALL parenthesized items to the body of their enclosing parent clause.\n")
+              .append("    Do NOT create numbered entries for (a), (b), (c), (1), (2) etc. — they are list items, not clause headings.\n");
+        }
+        sb.append("For the \"number\" field always use Arabic digits and dots only:\n")
+                .append("  \"Madde 3\" → \"3\", \"§ 2.1\" → \"2.1\", \"Article 5\" → \"5\"");
+        if (parenEnabled) {
+            sb.append(",\n  \"(1)\" inside clause 4 → \"4.1\", \"(b)\" inside clause 4 → \"4.2\".\n");
+        } else {
+            sb.append(".\n");
+        }
+        sb.append("If a block clearly marks the start of a new section/clause even without a visible number (e.g. a bold all-caps heading that begins a section), ")
                 .append("assign it a sequential number continuing from the last known clause.\n")
                 .append("IMPORTANT: Every sub-clause (e.g. \"1.1\", \"1.2\") MUST be returned as a SEPARATE entry ")
                 .append("with its own \"number\" and \"blocks\". Do NOT merge sub-clauses into their parent clause.\n")
@@ -273,18 +489,26 @@ public final class DocxClauseExtractor {
                 .append("heading/introductory text, NOT the blocks of its sub-clauses (\"1.1\", \"1.2\").\n")
                 .append("Example: if clause 1 has sub-clauses (1) and (2), return THREE separate entries: ")
                 .append("{\"number\":\"1\",...}, {\"number\":\"1.1\",...}, {\"number\":\"1.2\",...}.\n")
-                .append("Blocks that belong to no numbered clause (title, parties, preamble, signatures) are omitted; return the ")
+                .append("Blocks that belong to no numbered clause (document title/header, pre-contractual recitals before clause 1, signature blocks at the end) are omitted; return the ")
                 .append("document title in the target language in \"title\" if it is in this part, else \"\".\n")
+                .append("CRITICAL: Address lines, party names, company details, PO boxes, and registration numbers that appear ")
+                .append("AFTER a sub-clause heading (e.g. after \"1.1.\") are PART OF THAT SUB-CLAUSE — assign them to it. ")
+                .append("Do NOT treat them as 'parties/preamble' and omit them.\n")
+                .append("ANNEX/EXHIBIT LIST RULE: A block that lists document annexes/exhibits (e.g. \"EKLER:\", \"EK - 1 ...\", \"Annex 1 ...\", ")
+                .append("\"ATTACHMENTS:\") is NOT a new clause — assign it to the LAST numbered clause in this chunk. ")
+                .append("Do NOT invent a new clause number for it (e.g. do not assign it clause 19 if the last real clause was 18).\n")
                 .append("The previous part ended inside clause \"").append(prev).append("\": if the first blocks continue it, ")
                 .append("return that same number again.\n")
                 .append("IMPORTANT — clause numbering must continue logically from \"").append(prev).append("\":\n")
                 .append("  - The next top-level clause after N is typically N+1 but may skip (e.g. 9→11 if 10 is absent).\n")
                 .append("  - A sub-clause of N is N.1; a sub-clause of N.K is N.K.1.\n")
                 .append("  - After sub-clause N.K the next valid numbers are: N.K+1 (sibling), N+1 (back to parent level),\n")
-                .append("    or N+1.1 (parent advanced then into sub-clause). All of these are acceptable.\n")
-                .append("  - Parenthesized sub-clauses (1),(2)/(a),(b)/(i),(ii) are sequential children of the enclosing clause: ")
-                .append("first → N.1, second → N.2, etc. (continuing from the last assigned child if the chunk starts mid-sequence).\n")
-                .append("  - Numbers appearing in body text as legal references (e.g. \"HMK'nın 193. maddesi\", ")
+                .append("    or N+1.1 (parent advanced then into sub-clause). All of these are acceptable.\n");
+        if (parenEnabled) {
+            sb.append("  - Parenthesized sub-clauses (1),(2)/(a),(b)/(i),(ii) are sequential children of the enclosing clause: ")
+              .append("first → N.1, second → N.2, etc. (continuing from the last assigned child if the chunk starts mid-sequence).\n");
+        }
+        sb.append("  - Numbers appearing in body text as legal references (e.g. \"HMK'nın 193. maddesi\", ")
                 .append("\"Article 193 of the Code\") are NOT new clause headings — do NOT assign them a clause number.\n")
                 .append("  - Only assign a new clause number when the block is a structural heading that ")
                 .append("advances the document outline by one logical step.\n")

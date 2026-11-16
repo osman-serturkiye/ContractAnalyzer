@@ -24,6 +24,25 @@ public final class TextNormalizer {
     private TextNormalizer() {
     }
 
+    /**
+     * Folds Turkish-specific characters to their ASCII near-equivalents so that
+     * OCR output (which may confuse İ↔I, ı↔i, Ş↔S etc.) compares fairly against
+     * the original DOCX text.
+     *
+     * <p>This mapping is applied ONLY inside {@link #normalize} — it is NOT applied
+     * to the displayed clause content, only to the token stream used for diff and
+     * similarity computation.
+     */
+    private static String foldTurkish(String t) {
+        // Upper-case fold: Ü Ğ İ Ş Ç Ö → U G I S C O
+        t = t.replace('Ü', 'U').replace('Ğ', 'G').replace('İ', 'I')
+             .replace('Ş', 'S').replace('Ç', 'C').replace('Ö', 'O');
+        // Lower-case fold: ü ğ ı ş ç ö → u g i s c o
+        t = t.replace('ü', 'u').replace('ğ', 'g').replace('ı', 'i')
+             .replace('ş', 's').replace('ç', 'c').replace('ö', 'o');
+        return t;
+    }
+
     public static String normalize(String md) {
         if (md == null) {
             return "";
@@ -45,6 +64,9 @@ public final class TextNormalizer {
         t = t.replaceAll(
                 "(?m)^\\s*\\|?\\s*:?[\\-\u2500]{3,}:?\\s*(\\|\\s*:?[\\-\u2500]{3,}:?\\s*)*\\|?\\s*$",
                 " ");
+        // Also strip standalone horizontal rules (--- or *** or ___ on their own line)
+        // that OCR emits for section separators / page borders.
+        t = t.replaceAll("(?m)^\\s*[-*_\u2500\u2501\u2502]{3,}\\s*$", " ");
 
         // 4. HTML tags → space
         t = t.replaceAll("<[^>]+>", " ");
@@ -53,9 +75,10 @@ public final class TextNormalizer {
         t = t.replaceAll("(?m)^\\s{0,3}#{1,6}\\s+", "");
 
         // 6. Markdown emphasis/strong markers: *** ** * ___ __ _
-        //    Must run BEFORE list-marker stripping so that "**- item" patterns (bold bullet)
-        //    are reduced to "- item" first; the list stripper then removes the dash correctly.
-        //    Uses explicit alternation with word-boundary guards; does NOT mix with | literals.
+        //    Also strip backslash escape sequences (\_ \* \\ etc.) that DocxReader
+        //    produces for literal underscores/asterisks in DOCX text — OCR never
+        //    emits these escapes so they create false diff tokens (e.g. "\\_" vs "_").
+        t = t.replaceAll("\\\\([_*\\\\`|])", "$1");   // unescape \_ \* \\ \` \|  → bare char
         t = t.replaceAll("\\*{1,3}", "");
         t = t.replaceAll("(?<![\\p{L}\\p{N}])_{1,3}(?![\\p{L}\\p{N}])", "");
 
@@ -75,8 +98,20 @@ public final class TextNormalizer {
         // 9. Markdown inline code backticks
         t = t.replaceAll("`+", "");
 
-        // 10. Collapse all whitespace to a single space
+        // 10. OCR artifacts: stray lone punctuation lines (e.g. "." or ". ." on their own line)
+        //     that OCR engines emit when they misread table borders or list markers.
+        //     Only remove lines that are NOTHING but dots, spaces and commas (not real sentences).
+        t = t.replaceAll("(?m)^\\s*[\\.\\,\\;]{1,3}\\s*$", " ");
+
+        // 11. Collapse all whitespace to a single space
         t = t.replaceAll("\\s+", " ").trim();
+
+        // 12. Fold Turkish special characters to ASCII near-equivalents so that
+        //     OCR errors like İ↔I or ı↔i do not create spurious diff tokens.
+        //     Applied last so earlier steps (Unicode NFKC, typographic replacements)
+        //     have already run; only affects the diff/similarity token stream —
+        //     the displayed clause content is never passed through this method.
+        t = foldTurkish(t);
         return t;
     }
 }
