@@ -105,7 +105,7 @@ public class OriginalSignedAnalyze extends UnifiedAgent {
             // Upload HTML report
             IDocument analyzeDoc = GeneralLib.getDocFromFolderNode((IFolder) refInfo, analyzeNode);
             if(analyzeDoc == null){
-                analyzeDoc = GeneralLib.newFileToDocumentClass(reportHTML,"5e6ba933-9f0b-49c5-82b4-1759021a91c8","html");
+                analyzeDoc = GeneralLib.newFileToDocumentClass(reportHTML,"b381594b-05a9-4508-a22e-831f7f8ce8a8","html");
                 analyzeDoc.commit();
                 GeneralLib._info("created analyze document.:" + analyzeDoc);
                 boolean addToNode = GeneralLib.addToNode((IFolder) refInfo, analyzeDoc, analyzeNode);
